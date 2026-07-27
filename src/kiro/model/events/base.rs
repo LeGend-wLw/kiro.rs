@@ -115,6 +115,14 @@ impl Event {
 
         match event_type {
             EventType::AssistantResponse => {
+                let payload: serde_json::Value = frame.payload_as_json()?;
+                if payload.get("reasoningText").is_some()
+                    || payload.get("redactedContent").is_some()
+                    || payload.get("reasoningContentEvent").is_some()
+                {
+                    let reasoning = super::ReasoningContentEvent::from_frame(&frame)?;
+                    return Ok(Self::ReasoningContent(reasoning));
+                }
                 let payload = super::AssistantResponseEvent::from_frame(&frame)?;
                 Ok(Self::AssistantResponse(payload))
             }
@@ -169,6 +177,23 @@ impl Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::parser::header::{HeaderValue, Headers};
+
+    fn event_frame(event_type: &str, payload: &str) -> Frame {
+        let mut headers = Headers::new();
+        headers.insert(
+            ":message-type".to_string(),
+            HeaderValue::String("event".to_string()),
+        );
+        headers.insert(
+            ":event-type".to_string(),
+            HeaderValue::String(event_type.to_string()),
+        );
+        Frame {
+            headers,
+            payload: payload.as_bytes().to_vec(),
+        }
+    }
 
     #[test]
     fn test_event_type_from_str() {
@@ -192,5 +217,65 @@ mod tests {
             "assistantResponseEvent"
         );
         assert_eq!(EventType::ToolUse.as_str(), "toolUseEvent");
+    }
+
+    #[test]
+    fn test_assistant_response_reasoning_text_is_reasoning_event() {
+        // Given: Kiro carries a reasoning union in an assistant response frame.
+        let frame = event_frame(
+            "assistantResponseEvent",
+            r#"{"reasoningText":{"text":"variant","signature":"sig-variant"}}"#,
+        );
+
+        // When: the frame is dispatched.
+        let event = Event::from_frame(frame).unwrap();
+
+        // Then: reasoning is preserved instead of becoming an empty text event.
+        match event {
+            Event::ReasoningContent(reasoning) => {
+                assert_eq!(reasoning.text, "variant");
+                assert_eq!(reasoning.signature.as_deref(), Some("sig-variant"));
+            }
+            other => panic!("expected reasoning event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_assistant_response_content_remains_text_event() {
+        // Given: a regular Kiro assistant response frame.
+        let frame = event_frame(
+            "assistantResponseEvent",
+            r#"{"content":"answer","modelId":"claude-opus-5"}"#,
+        );
+
+        // When: the frame is dispatched.
+        let event = Event::from_frame(frame).unwrap();
+
+        // Then: ordinary content is not reclassified as reasoning.
+        match event {
+            Event::AssistantResponse(response) => assert_eq!(response.content, "answer"),
+            other => panic!("expected assistant response event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_assistant_response_wrapped_reasoning_is_reasoning_event() {
+        // Given: a reasoning payload wrapped inside assistantResponseEvent.
+        let frame = event_frame(
+            "assistantResponseEvent",
+            r#"{"reasoningContentEvent":{"text":"wrapped","signature":"sig-wrapped"}}"#,
+        );
+
+        // When: the frame is dispatched.
+        let event = Event::from_frame(frame).unwrap();
+
+        // Then: the wrapper is classified as reasoning rather than empty text.
+        match event {
+            Event::ReasoningContent(reasoning) => {
+                assert_eq!(reasoning.text, "wrapped");
+                assert_eq!(reasoning.signature.as_deref(), Some("sig-wrapped"));
+            }
+            other => panic!("expected reasoning event, got {other:?}"),
+        }
     }
 }
