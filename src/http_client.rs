@@ -2,10 +2,13 @@
 //!
 //! 提供统一的 HTTP Client 构建功能，支持代理配置
 
-use reqwest::{Client, Proxy};
+use reqwest::{Certificate, Client, Proxy};
+use std::fs;
 use std::time::Duration;
 
 use crate::model::config::TlsBackend;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 代理配置
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -48,8 +51,11 @@ pub fn build_client(
     proxy: Option<&ProxyConfig>,
     timeout_secs: u64,
     tls_backend: TlsBackend,
+    ca_cert_path: Option<&str>,
 ) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    let mut builder = Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(Duration::from_secs(timeout_secs));
 
     match tls_backend {
         TlsBackend::Rustls => {
@@ -67,6 +73,12 @@ pub fn build_client(
         }
     }
 
+    if let Some(path) = ca_cert_path.filter(|path| !path.trim().is_empty()) {
+        let cert = load_root_certificate(path)?;
+        builder = builder.add_root_certificate(cert);
+        tracing::debug!("HTTP Client 已加载自定义根证书: {}", path);
+    }
+
     if let Some(proxy_config) = proxy {
         let mut proxy = Proxy::all(&proxy_config.url)?;
 
@@ -80,6 +92,13 @@ pub fn build_client(
     }
 
     Ok(builder.build()?)
+}
+
+fn load_root_certificate(path: &str) -> anyhow::Result<Certificate> {
+    let bytes = fs::read(path)?;
+    Certificate::from_pem(&bytes)
+        .or_else(|_| Certificate::from_der(&bytes))
+        .map_err(|e| anyhow::anyhow!("加载根证书失败 {}: {}", path, e))
 }
 
 #[cfg(test)]
@@ -104,14 +123,14 @@ mod tests {
 
     #[test]
     fn test_build_client_without_proxy() {
-        let client = build_client(None, 30, TlsBackend::Rustls);
+        let client = build_client(None, 30, TlsBackend::Rustls, None);
         assert!(client.is_ok());
     }
 
     #[test]
     fn test_build_client_with_proxy() {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
-        let client = build_client(Some(&config), 30, TlsBackend::Rustls);
+        let client = build_client(Some(&config), 30, TlsBackend::Rustls, None);
         assert!(client.is_ok());
     }
 }
