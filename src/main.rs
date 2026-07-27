@@ -111,10 +111,7 @@ async fn main() {
 
     // 校验所有凭据声明的端点都已注册
     for cred in &credentials_list {
-        let name = cred
-            .endpoint
-            .as_deref()
-            .unwrap_or(&config.default_endpoint);
+        let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
         if !endpoints.contains_key(name) {
             tracing::error!(
                 "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
@@ -155,6 +152,7 @@ async fn main() {
         auth_type: config.count_tokens_auth_type.clone(),
         proxy: proxy_config,
         tls_backend: config.tls_backend,
+        ca_cert_path: config.ca_cert_path.clone(),
     });
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）

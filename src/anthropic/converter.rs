@@ -4,12 +4,14 @@
 
 use std::collections::HashMap;
 
+use base64::Engine;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-    HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
+    HistoryUserMessage, KiroDocument, KiroImage, Message, ReasoningContent, UserInputMessage,
+    UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
@@ -32,14 +34,26 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     };
 
     // type（必须是字符串）
-    if !obj.get("type").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
-        obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
+    if !obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+    {
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
     }
 
     // properties（必须是 object）
     match obj.get("properties") {
         Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new())); }
+        _ => {
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            );
+        }
     }
 
     // required（必须是 string 数组）
@@ -56,7 +70,12 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     // additionalProperties（允许 bool 或 object，其他按 true 处理）
     match obj.get("additionalProperties") {
         Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true)); }
+        _ => {
+            obj.insert(
+                "additionalProperties".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
     }
 
     serde_json::Value::Object(obj)
@@ -98,7 +117,9 @@ pub fn map_model(model: &str) -> Option<String> {
             None
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("4-5") || model_lower.contains("4.5") {
+        if model_lower == "claude-opus-5" || model_lower.contains("opus-5-") {
+            Some("claude-opus-5".to_string())
+        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-opus-4.6".to_string())
@@ -124,7 +145,19 @@ pub fn map_model(model: &str) -> Option<String> {
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped) if mapped.starts_with("gpt-5.6-") => 272_000,
-        Some(mapped) if mapped == "claude-sonnet-5" || mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" || mapped == "claude-opus-4.7" || mapped == "claude-opus-4.8" => 1_000_000,
+        Some(mapped)
+            if matches!(
+                mapped.as_str(),
+                "claude-sonnet-5"
+                    | "claude-sonnet-4.6"
+                    | "claude-opus-5"
+                    | "claude-opus-4.6"
+                    | "claude-opus-4.7"
+                    | "claude-opus-4.8"
+            ) =>
+        {
+            1_000_000
+        }
         _ => 200_000,
     }
 }
@@ -139,6 +172,7 @@ pub fn model_supports_native_reasoning(model: &str) -> bool {
         Some("gpt-5.6-sol")
             | Some("gpt-5.6-terra")
             | Some("gpt-5.6-luna")
+            | Some("claude-opus-5")
             | Some("claude-opus-4.6")
             | Some("claude-opus-4.7")
             | Some("claude-opus-4.8")
@@ -170,6 +204,10 @@ pub struct ConversionResult {
 pub enum ConversionError {
     UnsupportedModel(String),
     EmptyMessages,
+    InvalidThinking(String),
+    InvalidDocument(String),
+    TooManyDocuments(usize),
+    DuplicateDocumentName(String),
 }
 
 impl std::fmt::Display for ConversionError {
@@ -177,11 +215,76 @@ impl std::fmt::Display for ConversionError {
         match self {
             ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
+            ConversionError::InvalidThinking(message) => {
+                write!(f, "thinking 配置无效: {}", message)
+            }
+            ConversionError::InvalidDocument(message) => write!(f, "文档无效: {}", message),
+            ConversionError::TooManyDocuments(count) => {
+                write!(f, "文档数量超过 Kiro 限制: {} > 5", count)
+            }
+            ConversionError::DuplicateDocumentName(name) => {
+                write!(f, "文档名称重复: {}", name)
+            }
         }
     }
 }
 
 impl std::error::Error for ConversionError {}
+
+fn validate_thinking(req: &MessagesRequest) -> Result<(), ConversionError> {
+    let Some(thinking) = &req.thinking else {
+        return Ok(());
+    };
+
+    if let Some(display) = &thinking.display
+        && !matches!(display.as_str(), "summarized" | "omitted")
+    {
+        return Err(ConversionError::InvalidThinking(format!(
+            "display 必须是 summarized 或 omitted，实际为 {}",
+            display
+        )));
+    }
+
+    match thinking.thinking_type.as_str() {
+        "enabled" => {
+            let budget = thinking.budget_tokens.ok_or_else(|| {
+                ConversionError::InvalidThinking("enabled 模式必须提供 budget_tokens".to_string())
+            })?;
+            if budget < 1024 {
+                return Err(ConversionError::InvalidThinking(
+                    "budget_tokens 必须至少为 1024".to_string(),
+                ));
+            }
+            if budget >= req.max_tokens {
+                return Err(ConversionError::InvalidThinking(
+                    "budget_tokens 必须小于 max_tokens".to_string(),
+                ));
+            }
+        }
+        "adaptive" => {
+            if thinking.budget_tokens.is_some() {
+                return Err(ConversionError::InvalidThinking(
+                    "adaptive 模式不能提供 budget_tokens".to_string(),
+                ));
+            }
+        }
+        "disabled" => {
+            if thinking.budget_tokens.is_some() || thinking.display.is_some() {
+                return Err(ConversionError::InvalidThinking(
+                    "disabled 模式不能提供 budget_tokens 或 display".to_string(),
+                ));
+            }
+        }
+        other => {
+            return Err(ConversionError::InvalidThinking(format!(
+                "不支持的 type: {}",
+                other
+            )));
+        }
+    }
+
+    Ok(())
+}
 
 /// 从 metadata.user_id 中提取 session UUID
 ///
@@ -257,6 +360,8 @@ fn create_placeholder_tool(name: &str) -> Tool {
 
 /// 将 Anthropic 请求转换为 Kiro 请求
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
+    validate_thinking(req)?;
+
     // 1. 映射模型
     let model_id = map_model(&req.model)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
@@ -295,7 +400,8 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
     let last_message = messages.last().unwrap();
-    let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
+    let (text_content, images, documents, tool_results) =
+        process_message_content(&last_message.content)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
@@ -303,6 +409,8 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
+
+    validate_documents(&documents, &history)?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -348,6 +456,9 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     if !images.is_empty() {
         user_input = user_input.with_images(images);
     }
+    if !documents.is_empty() {
+        user_input = user_input.with_documents(documents);
+    }
 
     let current_message = CurrentMessage::new(user_input);
 
@@ -360,10 +471,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_history(history);
 
     if !tool_name_map.is_empty() {
-        tracing::info!(
-            "工具名称映射: {} 个超长名称已缩短",
-            tool_name_map.len()
-        );
+        tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
 
     Ok(ConversionResult {
@@ -382,9 +490,10 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
 /// 处理消息内容，提取文本、图片和工具结果
 fn process_message_content(
     content: &serde_json::Value,
-) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+) -> Result<(String, Vec<KiroImage>, Vec<KiroDocument>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
+    let mut documents = Vec::new();
     let mut tool_results = Vec::new();
 
     match content {
@@ -393,6 +502,15 @@ fn process_message_content(
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
+                if item.get("type").and_then(serde_json::Value::as_str) == Some("document") {
+                    let block =
+                        serde_json::from_value::<ContentBlock>(item.clone()).map_err(|e| {
+                            ConversionError::InvalidDocument(format!("无法解析内容块: {}", e))
+                        })?;
+                    documents.push(parse_pdf_document(block)?);
+                    continue;
+                }
+
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
                         "text" => {
@@ -434,7 +552,66 @@ fn process_message_content(
         _ => {}
     }
 
-    Ok((text_parts.join("\n"), images, tool_results))
+    Ok((text_parts.join("\n"), images, documents, tool_results))
+}
+
+/// 将 Anthropic PDF 文档转换为 Kiro 原生文档。
+fn parse_pdf_document(block: ContentBlock) -> Result<KiroDocument, ConversionError> {
+    let source = block
+        .source
+        .ok_or_else(|| ConversionError::InvalidDocument("缺少 source".to_string()))?;
+
+    if source.source_type != "base64" {
+        return Err(ConversionError::InvalidDocument(
+            "source.type 必须是 base64".to_string(),
+        ));
+    }
+    if source.media_type != "application/pdf" {
+        return Err(ConversionError::InvalidDocument(
+            "source.media_type 必须是 application/pdf".to_string(),
+        ));
+    }
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&source.data)
+        .map_err(|e| ConversionError::InvalidDocument(format!("Base64 解码失败: {}", e)))?;
+    if !decoded.starts_with(b"%PDF-") {
+        return Err(ConversionError::InvalidDocument(
+            "文件内容不是有效的 PDF".to_string(),
+        ));
+    }
+
+    let name = block
+        .title
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| "document.pdf".to_string());
+
+    Ok(KiroDocument::from_base64(name, "pdf", source.data))
+}
+
+/// 校验一个会话中的 PDF 数量和文档名称。
+fn validate_documents(
+    current_documents: &[KiroDocument],
+    history: &[Message],
+) -> Result<(), ConversionError> {
+    let mut documents = current_documents.to_vec();
+    for message in history {
+        if let Message::User(user_message) = message {
+            documents.extend(user_message.user_input_message.documents.iter().cloned());
+        }
+    }
+
+    if documents.len() > 5 {
+        return Err(ConversionError::TooManyDocuments(documents.len()));
+    }
+
+    let mut names = std::collections::HashSet::new();
+    for document in documents {
+        if !names.insert(document.name.clone()) {
+            return Err(ConversionError::DuplicateDocumentName(document.name));
+        }
+    }
+    Ok(())
 }
 
 /// 从 media_type 获取图片格式
@@ -615,7 +792,10 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
 }
 
 /// 转换工具定义
-fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut HashMap<String, String>) -> Vec<Tool> {
+fn convert_tools(
+    tools: &Option<Vec<super::types::Tool>>,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
@@ -646,7 +826,9 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
                 tool_specification: ToolSpecification {
                     name: map_tool_name(&t.name, tool_name_map),
                     description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
+                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
+                        t.input_schema
+                    ))),
                 },
             }
         })
@@ -662,7 +844,7 @@ fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
         if t.thinking_type == "enabled" {
             return Some(format!(
                 "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
-                t.budget_tokens
+                t.budget_tokens.unwrap_or_default()
             ));
         } else if t.thinking_type == "adaptive" {
             let effort = req
@@ -691,7 +873,11 @@ fn build_additional_model_request_fields(req: &MessagesRequest) -> Option<serde_
     if !model_supports_native_reasoning(&req.model) {
         return None;
     }
-    let thinking_enabled = req.thinking.as_ref().map(|t| t.is_enabled()).unwrap_or(false);
+    let thinking_enabled = req
+        .thinking
+        .as_ref()
+        .map(|t| t.is_enabled())
+        .unwrap_or(false);
     if !thinking_enabled {
         return None;
     }
@@ -705,8 +891,13 @@ fn build_additional_model_request_fields(req: &MessagesRequest) -> Option<serde_
             "reasoning": { "type": "enabled", "effort": effort }
         }))
     } else {
+        let display = req
+            .thinking
+            .as_ref()
+            .and_then(|thinking| thinking.display.as_deref())
+            .unwrap_or("summarized");
         Some(serde_json::json!({
-            "thinking": { "type": "adaptive", "display": "summarized" },
+            "thinking": { "type": "adaptive", "display": display },
             "output_config": { "effort": effort }
         }))
     }
@@ -720,7 +911,12 @@ fn build_additional_model_request_fields(req: &MessagesRequest) -> Option<serde_
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
+fn build_history(
+    req: &MessagesRequest,
+    messages: &[super::types::Message],
+    model_id: &str,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -813,6 +1009,14 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
         history.push(Message::Assistant(auto_assistant));
     }
 
+    if !model_supports_native_reasoning(&req.model) {
+        for message in &mut history {
+            if let Message::Assistant(assistant) = message {
+                assistant.assistant_response_message.reasoning_content = None;
+            }
+        }
+    }
+
     Ok(history)
 }
 
@@ -823,14 +1027,16 @@ fn merge_user_messages(
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
+    let mut all_documents = Vec::new();
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
+        let (text, images, documents, tool_results) = process_message_content(&msg.content)?;
         if !text.is_empty() {
             content_parts.push(text);
         }
         all_images.extend(images);
+        all_documents.extend(documents);
         all_tool_results.extend(tool_results);
     }
 
@@ -840,6 +1046,9 @@ fn merge_user_messages(
 
     if !all_images.is_empty() {
         user_msg = user_msg.with_images(all_images);
+    }
+    if !all_documents.is_empty() {
+        user_msg = user_msg.with_documents(all_documents);
     }
 
     if !all_tool_results.is_empty() {
@@ -861,6 +1070,8 @@ fn convert_assistant_message(
     let mut thinking_content = String::new();
     let mut text_content = String::new();
     let mut tool_uses = Vec::new();
+    let mut reasoning_content = None;
+    let mut reasoning_block_count = 0usize;
 
     match &msg.content {
         serde_json::Value::String(s) => {
@@ -871,8 +1082,21 @@ fn convert_assistant_message(
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
                         "thinking" => {
+                            reasoning_block_count += 1;
                             if let Some(thinking) = block.thinking {
                                 thinking_content.push_str(&thinking);
+                                if let Some(signature) =
+                                    block.signature.filter(|value| !value.trim().is_empty())
+                                {
+                                    reasoning_content =
+                                        Some(ReasoningContent::new(thinking, signature));
+                                }
+                            }
+                        }
+                        "redacted_thinking" => {
+                            reasoning_block_count += 1;
+                            if let Some(data) = block.data.filter(|value| !value.is_empty()) {
+                                reasoning_content = Some(ReasoningContent::redacted(data));
                             }
                         }
                         "text" => {
@@ -884,7 +1108,8 @@ fn convert_assistant_message(
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 let mapped_name = map_tool_name(&name, tool_name_map);
-                                tool_uses.push(ToolUseEntry::new(id, mapped_name).with_input(input));
+                                tool_uses
+                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
                         }
                         _ => {}
@@ -895,10 +1120,20 @@ fn convert_assistant_message(
         _ => {}
     }
 
+    if reasoning_block_count != 1 {
+        reasoning_content = None;
+    }
+
     // 组合 thinking 和 text 内容
     // 格式: <thinking>思考内容</thinking>\n\ntext内容
     // 注意: Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
-    let final_content = if !thinking_content.is_empty() {
+    let final_content = if reasoning_content.is_some() {
+        if text_content.is_empty() {
+            " ".to_string()
+        } else {
+            text_content
+        }
+    } else if !thinking_content.is_empty() {
         if !text_content.is_empty() {
             format!(
                 "<thinking>{}</thinking>\n\n{}",
@@ -916,6 +1151,9 @@ fn convert_assistant_message(
     let mut assistant = AssistantMessage::new(final_content);
     if !tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(tool_uses);
+    }
+    if let Some(reasoning_content) = reasoning_content {
+        assistant = assistant.with_reasoning_content(reasoning_content);
     }
 
     Ok(HistoryAssistantMessage {
@@ -936,6 +1174,18 @@ fn merge_assistant_messages(
 
     let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
+    let mut reasoning_content = None;
+    let reasoning_block_count = messages
+        .iter()
+        .filter_map(|message| message.content.as_array())
+        .flatten()
+        .filter(|block| {
+            matches!(
+                block.get("type").and_then(serde_json::Value::as_str),
+                Some("thinking" | "redacted_thinking")
+            )
+        })
+        .count();
 
     for msg in messages {
         let converted = convert_assistant_message(msg, tool_name_map)?;
@@ -945,6 +1195,9 @@ fn merge_assistant_messages(
         }
         if let Some(tus) = am.tool_uses {
             all_tool_uses.extend(tus);
+        }
+        if am.reasoning_content.is_some() {
+            reasoning_content = am.reasoning_content;
         }
     }
 
@@ -958,6 +1211,11 @@ fn merge_assistant_messages(
     if !all_tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(all_tool_uses);
     }
+    if reasoning_block_count == 1
+        && let Some(reasoning_content) = reasoning_content
+    {
+        assistant = assistant.with_reasoning_content(reasoning_content);
+    }
     Ok(HistoryAssistantMessage {
         assistant_response_message: assistant,
     })
@@ -970,21 +1228,17 @@ mod tests {
     #[test]
     fn test_map_model_sonnet() {
         assert!(
-            map_model("claude-sonnet-4-20250514")
+            map_model("claude-sonnet-4-5-20250929")
                 .unwrap()
                 .contains("sonnet")
         );
-        assert!(
-            map_model("claude-3-5-sonnet-20241022")
-                .unwrap()
-                .contains("sonnet")
-        );
+        assert!(map_model("claude-sonnet-4-6").unwrap().contains("sonnet"));
     }
 
     #[test]
     fn test_map_model_opus() {
         assert!(
-            map_model("claude-opus-4-20250514")
+            map_model("claude-opus-4-5-20251101")
                 .unwrap()
                 .contains("opus")
         );
@@ -1039,6 +1293,47 @@ mod tests {
     }
 
     #[test]
+    fn test_map_model_opus_5_native_reasoning() {
+        assert_eq!(
+            map_model("claude-opus-5"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-thinking"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
+        assert!(model_supports_native_reasoning("claude-opus-5"));
+
+        let req = MessagesRequest {
+            model: "claude-opus-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(super::super::types::Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: None,
+                display: Some("omitted".to_string()),
+            }),
+            output_config: Some(super::super::types::OutputConfig {
+                effort: "xhigh".to_string(),
+            }),
+            metadata: None,
+        };
+
+        let fields = build_additional_model_request_fields(&req).unwrap();
+        assert_eq!(fields["thinking"]["type"], "adaptive");
+        assert_eq!(fields["thinking"]["display"], "omitted");
+        assert_eq!(fields["output_config"]["effort"], "xhigh");
+    }
+
+    #[test]
     fn test_map_model_sonnet_5_native_reasoning() {
         assert_eq!(
             map_model("claude-sonnet-5"),
@@ -1050,6 +1345,36 @@ mod tests {
         );
         assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
         assert!(model_supports_native_reasoning("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn test_enabled_thinking_rejects_budget_not_below_max_tokens() {
+        // Given: enabled thinking whose budget consumes the full output allowance.
+        let request = MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 4096,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(super::super::types::Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: Some(4096),
+                display: Some("summarized".to_string()),
+            }),
+            output_config: None,
+            metadata: None,
+        };
+
+        // When: the request crosses the protocol conversion boundary.
+        let error = convert_request(&request).expect_err("invalid budget should be rejected");
+
+        // Then: callers receive a typed invalid-thinking error.
+        assert!(matches!(error, ConversionError::InvalidThinking(_)));
     }
 
     #[test]
@@ -1086,7 +1411,8 @@ mod tests {
             tool_choice: None,
             thinking: Some(super::super::types::Thinking {
                 thinking_type: "adaptive".to_string(),
-                budget_tokens: 20000,
+                budget_tokens: None,
+                display: None,
             }),
             output_config: Some(super::super::types::OutputConfig {
                 effort: "xhigh".to_string(),
@@ -1110,7 +1436,7 @@ mod tests {
     fn test_determine_chat_trigger_type() {
         // 无工具时返回 MANUAL
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![],
             stream: false,
@@ -1167,13 +1493,18 @@ mod tests {
 
     #[test]
     fn test_shorten_tool_name_deterministic() {
-        let long_name = "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
+        let long_name =
+            "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
         assert!(long_name.len() > TOOL_NAME_MAX_LEN);
 
         let short1 = shorten_tool_name(long_name);
         let short2 = shorten_tool_name(long_name);
         assert_eq!(short1, short2, "相同输入应产生相同的短名称");
-        assert!(short1.len() <= TOOL_NAME_MAX_LEN, "短名称长度应 <= 63，实际 {}", short1.len());
+        assert!(
+            short1.len() <= TOOL_NAME_MAX_LEN,
+            "短名称长度应 <= 63，实际 {}",
+            short1.len()
+        );
     }
 
     #[test]
@@ -1206,7 +1537,8 @@ mod tests {
     fn test_tool_name_mapping_in_convert_request() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
         assert!(long_tool_name.len() > TOOL_NAME_MAX_LEN);
 
         let mut schema = std::collections::HashMap::new();
@@ -1214,14 +1546,12 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
-            messages: vec![
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!("test"),
-                },
-            ],
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
             system: None,
             stream: false,
             tools: Some(vec![AnthropicTool {
@@ -1248,8 +1578,12 @@ mod tests {
         assert!(short.len() <= TOOL_NAME_MAX_LEN);
 
         // Kiro 请求中的工具名应该是短名称
-        let tools = &result.conversation_state.current_message.user_input_message
-            .user_input_message_context.tools;
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
         assert_eq!(tools[0].tool_specification.name, *short);
     }
 
@@ -1257,14 +1591,15 @@ mod tests {
     fn test_tool_name_mapping_in_history() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
 
         let mut schema = std::collections::HashMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1327,7 +1662,7 @@ mod tests {
 
         // 创建一个请求，历史中有工具使用，但 tools 列表为空
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1426,7 +1761,7 @@ mod tests {
 
         // 测试带有 metadata 的请求，应该使用 session UUID 作为 conversationId
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -1458,7 +1793,7 @@ mod tests {
 
         // 测试没有 metadata 的请求，应该生成新的 UUID
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -1841,7 +2176,7 @@ mod tests {
         let msg2 = AnthropicMessage {
             role: "assistant".to_string(),
             content: serde_json::json!([
-                {"type": "thinking", "thinking": "I should read the file."},
+                {"type": "thinking", "thinking": "I should read the file.", "signature": "sig-second"},
                 {"type": "text", "text": "Let me read that file."},
                 {"type": "tool_use", "id": "toolu_01ABC", "name": "read_file", "input": {"path": "/test.txt"}}
             ]),
@@ -1852,11 +2187,182 @@ mod tests {
 
         let content = &result.assistant_response_message.content;
         assert!(content.contains("<thinking>"), "应包含 thinking 标签");
-        assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
+        assert!(
+            content.contains("Let me read that file"),
+            "应包含第二条消息的 text 内容"
+        );
 
-        let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
+        assert!(
+            result
+                .assistant_response_message
+                .reasoning_content
+                .is_none(),
+            "合并后的 turn 含多个 thinking 块时不能伪造单个 reasoningContent"
+        );
+
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
+    }
+
+    #[test]
+    fn test_assistant_thinking_signature_is_replayed_in_kiro_history() {
+        // Given: an Anthropic assistant response containing signed thinking.
+        use super::super::types::Message as AnthropicMessage;
+
+        let message = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {
+                    "type": "thinking",
+                    "thinking": "I should inspect the request contract.",
+                    "signature": "sig-valid"
+                },
+                {"type": "text", "text": "I found the issue."}
+            ]),
+        };
+
+        // When: the response is converted into a Kiro history message.
+        let converted = convert_assistant_message(&message, &mut HashMap::new())
+            .expect("assistant message conversion should succeed");
+        let json = serde_json::to_value(converted).expect("history message should serialize");
+
+        // Then: Kiro receives the signed reasoning in its machine-readable field.
+        assert_eq!(
+            json["assistantResponseMessage"]["reasoningContent"]["reasoningText"],
+            serde_json::json!({
+                "text": "I should inspect the request contract.",
+                "signature": "sig-valid"
+            })
+        );
+        assert_eq!(
+            json["assistantResponseMessage"]["content"],
+            "I found the issue."
+        );
+    }
+
+    #[test]
+    fn test_non_native_target_model_does_not_replay_signed_reasoning() {
+        // Given: signed reasoning from an earlier turn and a non-native target model.
+        use super::super::types::Message as AnthropicMessage;
+
+        let request = MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("question"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "thinking", "thinking": "thought", "signature": "sig-old"},
+                        {"type": "text", "text": "answer"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("continue"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        // When: the complete Kiro conversation state is built.
+        let converted = convert_request(&request).expect("request should convert");
+        let json = serde_json::to_value(converted.conversation_state)
+            .expect("conversation state should serialize");
+
+        // Then: model-bound reasoning is not forwarded to an incompatible target model.
+        assert!(
+            json["history"][1]["assistantResponseMessage"]
+                .get("reasoningContent")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_redacted_thinking_is_replayed_in_kiro_history() {
+        // Given: an Anthropic assistant response containing opaque redacted thinking.
+        use super::super::types::Message as AnthropicMessage;
+
+        let message = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "redacted_thinking", "data": "opaque-data"},
+                {"type": "tool_use", "id": "toolu_redacted", "name": "read_file", "input": {}}
+            ]),
+        };
+
+        // When: the response is converted into Kiro history.
+        let converted = convert_assistant_message(&message, &mut HashMap::new())
+            .expect("assistant message conversion should succeed");
+        let json = serde_json::to_value(converted).expect("history message should serialize");
+
+        // Then: the opaque data is represented by Kiro's redacted union branch.
+        assert_eq!(
+            json["assistantResponseMessage"]["reasoningContent"]["redactedContent"],
+            "opaque-data"
+        );
+    }
+
+    #[test]
+    fn test_whitespace_thinking_signature_is_not_replayed() {
+        // Given: a malformed signature containing only whitespace.
+        use super::super::types::Message as AnthropicMessage;
+
+        let message = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "thinking", "thinking": "thought", "signature": "   "}
+            ]),
+        };
+
+        // When: the response is converted into Kiro history.
+        let converted = convert_assistant_message(&message, &mut HashMap::new())
+            .expect("assistant message conversion should succeed");
+
+        // Then: no unverifiable machine reasoning is sent upstream.
+        assert!(
+            converted
+                .assistant_response_message
+                .reasoning_content
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_empty_thinking_with_signature_is_replayed() {
+        // Given: display=omitted output with an empty thinking summary and valid signature.
+        use super::super::types::Message as AnthropicMessage;
+
+        let message = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "thinking", "thinking": "", "signature": "sig-omitted"}
+            ]),
+        };
+
+        // When: the response is converted into Kiro history.
+        let converted = convert_assistant_message(&message, &mut HashMap::new())
+            .expect("assistant message conversion should succeed");
+        let json = serde_json::to_value(converted).expect("history message should serialize");
+
+        // Then: the empty text and signature remain a complete native block.
+        assert_eq!(
+            json["assistantResponseMessage"]["reasoningContent"]["reasoningText"],
+            serde_json::json!({"text": "", "signature": "sig-omitted"})
+        );
     }
 
     #[test]
@@ -1865,7 +2371,7 @@ mod tests {
         use super::super::types::Message as AnthropicMessage;
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1904,7 +2410,11 @@ mod tests {
         };
 
         let result = convert_request(&req);
-        assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "连续 assistant 消息场景不应报错: {:?}",
+            result.err()
+        );
 
         let state = result.unwrap().conversation_state;
         let mut found_tool_use = false;
@@ -1919,5 +2429,190 @@ mod tests {
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
+    }
+
+    #[test]
+    fn test_convert_request_forwards_pdf_on_current_message() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "Summarize this document."},
+                    {"type": "document", "title": "report.pdf", "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": "JVBERi0xLjQ="
+                    }}
+                ]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let json = serde_json::to_value(result.conversation_state).unwrap();
+        assert_eq!(
+            json["currentMessage"]["userInputMessage"]["documents"][0]["name"],
+            "report.pdf"
+        );
+        assert_eq!(
+            json["currentMessage"]["userInputMessage"]["documents"][0]["format"],
+            "pdf"
+        );
+        assert_eq!(
+            json["currentMessage"]["userInputMessage"]["documents"][0]["source"]["bytes"],
+            "JVBERi0xLjQ="
+        );
+    }
+
+    #[test]
+    fn test_convert_request_forwards_pdf_on_history_message() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "document", "title": "history.pdf", "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": "JVBERi0xLjQ="
+                        }}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("I will summarize it."),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Continue."),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let json = serde_json::to_value(result.conversation_state).unwrap();
+        assert_eq!(
+            json["history"][0]["userInputMessage"]["documents"][0]["name"],
+            "history.pdf"
+        );
+    }
+
+    #[test]
+    fn test_convert_request_rejects_invalid_pdf_document() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "document", "title": "not-a-pdf.pdf", "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": "aGVsbG8="
+                    }}
+                ]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert!(convert_request(&req).is_err());
+    }
+
+    #[test]
+    fn test_convert_request_rejects_more_than_five_documents() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let documents: Vec<_> = (0..6)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "document",
+                    "title": format!("document-{}.pdf", index),
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": "JVBERi0xLjQ="
+                    }
+                })
+            })
+            .collect();
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::Array(documents),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert!(convert_request(&req).is_err());
+    }
+
+    #[test]
+    fn test_convert_request_rejects_duplicate_document_names() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let document = serde_json::json!({
+            "type": "document",
+            "title": "same.pdf",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": "JVBERi0xLjQ="
+            }
+        });
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([document.clone(), document]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert!(convert_request(&req).is_err());
     }
 }

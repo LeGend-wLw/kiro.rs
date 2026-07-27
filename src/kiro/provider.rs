@@ -65,8 +65,9 @@ impl KiroProvider {
             default_endpoint
         );
         let tls_backend = token_manager.config().tls_backend;
+        let ca_cert_path = token_manager.config().ca_cert_path.as_deref();
         // 预热：构建全局代理对应的 Client
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
+        let initial_client = build_client(proxy.as_ref(), 720, tls_backend, ca_cert_path)
             .expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
@@ -88,16 +89,18 @@ impl KiroProvider {
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
         }
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
+        let client = build_client(
+            effective.as_ref(),
+            720,
+            self.tls_backend,
+            self.token_manager.config().ca_cert_path.as_deref(),
+        )?;
         cache.insert(effective, client.clone());
         Ok(client)
     }
 
     /// 根据凭据选择 endpoint 实现
-    fn endpoint_for(
-        &self,
-        credentials: &KiroCredentials,
-    ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+    fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let name = credentials
             .endpoint
             .as_deref()
@@ -111,13 +114,23 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, false).await
+    pub async fn call_api(
+        &self,
+        request_body: &str,
+        fallback_request_body: Option<&str>,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.call_api_with_retry(request_body, fallback_request_body, false)
+            .await
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, true).await
+    pub async fn call_api_stream(
+        &self,
+        request_body: &str,
+        fallback_request_body: Option<&str>,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.call_api_with_retry(request_body, fallback_request_body, true)
+            .await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -222,7 +235,12 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }
@@ -279,12 +297,15 @@ impl KiroProvider {
     async fn call_api_with_retry(
         &self,
         request_body: &str,
+        fallback_request_body: Option<&str>,
         is_stream: bool,
     ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut active_request_body = request_body;
+        let mut fallback_used = false;
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -320,7 +341,7 @@ impl KiroProvider {
             };
 
             let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
+            let body = endpoint.transform_api_body(active_request_body, &rctx);
 
             let base = self
                 .client_for(&ctx.credentials)?
@@ -359,6 +380,16 @@ impl KiroProvider {
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
+
+            if !fallback_used
+                && Self::is_thinking_signature_invalid(status, &body)
+                && let Some(fallback) = fallback_request_body
+            {
+                tracing::warn!("上游拒绝 thinking signature，剥离历史 reasoningContent 后重试一次");
+                active_request_body = fallback;
+                fallback_used = true;
+                continue;
+            }
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -408,7 +439,12 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }
@@ -506,14 +542,47 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
+    fn is_thinking_signature_invalid(status: reqwest::StatusCode, body: &str) -> bool {
+        status.is_client_error() && body.contains("THINKING_SIGNATURE_INVALID")
+    }
+
     fn retry_delay(attempt: usize) -> Duration {
         // 指数退避 + 少量抖动，避免上游抖动时放大故障
         const BASE_MS: u64 = 200;
-        const MAX_MS: u64 = 2_000;
-        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
-        let backoff = exp.min(MAX_MS);
-        let jitter_max = (backoff / 4).max(1);
+        const MAX_DELAY_MS: u64 = 30_000;
+        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(18) as u32));
+        let backoff = exp.min(MAX_DELAY_MS);
+        let jitter_max = (backoff / 4).min(MAX_DELAY_MS - backoff);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KiroProvider;
+    use std::time::Duration;
+
+    #[test]
+    fn retry_delay_at_high_attempts_is_capped_at_30_seconds() {
+        let delay = KiroProvider::retry_delay(usize::MAX);
+
+        assert_eq!(delay, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn thinking_signature_invalid_requires_a_client_error_marker() {
+        assert!(KiroProvider::is_thinking_signature_invalid(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"code":"THINKING_SIGNATURE_INVALID"}"#,
+        ));
+        assert!(!KiroProvider::is_thinking_signature_invalid(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"code":"OTHER_ERROR"}"#,
+        ));
+        assert!(!KiroProvider::is_thinking_signature_invalid(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "THINKING_SIGNATURE_INVALID",
+        ));
     }
 }
