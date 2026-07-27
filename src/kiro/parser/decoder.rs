@@ -151,6 +151,29 @@ impl EventStreamDecoder {
         Ok(())
     }
 
+    /// 标记输入流结束，并检查是否残留未完成的帧。
+    pub fn finish(&self) -> ParseResult<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        let needed = if self.buffer.len() >= PRELUDE_SIZE {
+            u32::from_be_bytes([
+                self.buffer[0],
+                self.buffer[1],
+                self.buffer[2],
+                self.buffer[3],
+            ]) as usize
+        } else {
+            PRELUDE_SIZE
+        };
+
+        Err(ParseError::Incomplete {
+            needed,
+            available: self.buffer.len(),
+        })
+    }
+
     /// 尝试解码下一个帧
     ///
     /// # Returns
@@ -289,7 +312,6 @@ impl EventStreamDecoder {
             }
         }
     }
-
 }
 
 /// 解码迭代器
@@ -333,5 +355,30 @@ mod tests {
 
         let result = decoder.decode();
         assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn test_decoder_finish_rejects_truncated_frame() {
+        // Given: a response ends with an incomplete Event Stream frame.
+        let mut decoder = EventStreamDecoder::new();
+        decoder.feed(&[0u8; 10]).unwrap();
+
+        // When: the caller marks the upstream response as finished.
+        let result = decoder.finish();
+
+        // Then: truncation is surfaced instead of being treated as a clean EOF.
+        assert!(matches!(
+            result,
+            Err(ParseError::Incomplete {
+                needed: PRELUDE_SIZE,
+                available: 10
+            })
+        ));
+    }
+
+    #[test]
+    fn test_decoder_finish_accepts_empty_buffer() {
+        let decoder = EventStreamDecoder::new();
+        assert!(decoder.finish().is_ok());
     }
 }
