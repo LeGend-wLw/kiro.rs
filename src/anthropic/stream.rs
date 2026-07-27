@@ -189,27 +189,21 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
     let after_open = &text[start_pos + "<thinking>".len()..];
 
     // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
-    let (thinking_raw, text_after) =
-        if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
-            (
-                &after_open[..end_pos],
-                &after_open[end_pos + "</thinking>\n\n".len()..],
-            )
-        } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
-            let after_tag = end_pos + "</thinking>".len();
-            (
-                &after_open[..end_pos],
-                after_open[after_tag..].trim_start(),
-            )
-        } else {
-            // 找不到有效的结束标签，不做提取
-            return (None, text.to_string());
-        };
+    let (thinking_raw, text_after) = if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
+        (
+            &after_open[..end_pos],
+            &after_open[end_pos + "</thinking>\n\n".len()..],
+        )
+    } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
+        let after_tag = end_pos + "</thinking>".len();
+        (&after_open[..end_pos], after_open[after_tag..].trim_start())
+    } else {
+        // 找不到有效的结束标签，不做提取
+        return (None, text.to_string());
+    };
 
     // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
-    let thinking_content = thinking_raw
-        .strip_prefix('\n')
-        .unwrap_or(thinking_raw);
+    let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
 
     // 组装剩余文本：跳过纯空白的 before 部分
     let mut remaining = String::new();
@@ -546,6 +540,10 @@ pub struct StreamContext {
     pub reasoning_block_open: bool,
     /// reasoning 块末尾 payload 带的 signature，暂存到关闭块时随 signature_delta 发出
     pub pending_reasoning_signature: Option<String>,
+    /// 上游流或协议转换失败时发送给客户端的终止错误
+    stream_error: Option<String>,
+    /// 是否已经进入不可恢复的流错误状态
+    stream_failed: bool,
 }
 
 impl StreamContext {
@@ -574,7 +572,35 @@ impl StreamContext {
             strip_thinking_leading_newline: false,
             reasoning_block_open: false,
             pending_reasoning_signature: None,
+            stream_error: None,
+            stream_failed: false,
         }
+    }
+
+    pub fn set_stream_error(&mut self, message: impl Into<String>) {
+        if !self.stream_failed {
+            self.stream_error = Some(message.into());
+            self.stream_failed = true;
+        }
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.stream_failed
+    }
+
+    fn take_stream_error_event(&mut self) -> Option<SseEvent> {
+        self.stream_error.take().map(|message| {
+            SseEvent::new(
+                "error",
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": message
+                    }
+                }),
+            )
+        })
     }
 
     /// 生成 message_start 事件
@@ -638,24 +664,34 @@ impl StreamContext {
 
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
-        match event {
-            Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
+        if self.stream_failed {
+            return self.take_stream_error_event().into_iter().collect();
+        }
+
+        let mut events = match event {
+            Event::ReasoningContent(reasoning) if self.thinking_enabled => {
+                self.process_reasoning_content(reasoning)
+            }
+            Event::ReasoningContent(_) => Vec::new(),
             Event::AssistantResponse(resp) => {
                 let mut events = self.close_reasoning_if_open();
-                events.extend(self.process_assistant_response(&resp.content));
+                if !self.stream_failed {
+                    events.extend(self.process_assistant_response(&resp.content));
+                }
                 events
             }
             Event::ToolUse(tool_use) => {
                 let mut events = self.close_reasoning_if_open();
-                events.extend(self.process_tool_use(tool_use));
+                if !self.stream_failed {
+                    events.extend(self.process_tool_use(tool_use));
+                }
                 events
             }
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
-                let actual_input_tokens = (context_usage.context_usage_percentage
-                    * (window_size as f64)
-                    / 100.0) as i32;
+                let actual_input_tokens =
+                    (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                 if context_usage.context_usage_percentage >= 100.0 {
@@ -674,6 +710,7 @@ impl StreamContext {
                 error_message,
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                self.set_stream_error(format!("Kiro error {error_code}: {error_message}"));
                 Vec::new()
             }
             Event::Exception {
@@ -683,12 +720,20 @@ impl StreamContext {
                 // 处理 ContentLengthExceededException
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
+                } else {
+                    self.set_stream_error(format!("Kiro exception {exception_type}: {message}"));
                 }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 Vec::new()
             }
             _ => Vec::new(),
+        };
+
+        if let Some(error) = self.take_stream_error_event() {
+            events.push(error);
         }
+
+        events
     }
 
     /// 处理 reasoningContentEvent — Q 上游对 thinking 模型推送的独立推理流。
@@ -698,6 +743,31 @@ impl StreamContext {
         &mut self,
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
     ) -> Vec<SseEvent> {
+        if let Some(data) = reasoning
+            .redacted_content
+            .as_ref()
+            .filter(|value| !value.is_empty())
+        {
+            let mut events = self.close_reasoning_if_open();
+            let index = self.state_manager.next_block_index();
+            events.extend(self.state_manager.handle_content_block_start(
+                index,
+                "redacted_thinking",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "redacted_thinking",
+                        "data": data
+                    }
+                }),
+            ));
+            if let Some(stop_event) = self.state_manager.handle_content_block_stop(index) {
+                events.push(stop_event);
+            }
+            return events;
+        }
+
         let mut events = Vec::new();
 
         if !self.reasoning_block_open {
@@ -710,7 +780,7 @@ impl StreamContext {
                 json!({
                     "type": "content_block_start",
                     "index": index,
-                    "content_block": { "type": "thinking", "thinking": "" }
+                    "content_block": { "type": "thinking", "thinking": "", "signature": "" }
                 }),
             ));
         }
@@ -756,14 +826,15 @@ impl StreamContext {
 
         let mut events = Vec::new();
 
-        let signature = match self.pending_reasoning_signature.take() {
-            Some(sig) if !sig.is_empty() => sig,
-            _ => {
-                tracing::warn!(
-                    "reasoning 块关闭时无 signature（上游未在 reasoningContentEvent 中提供），使用空串占位；下一轮回写该 thinking 块可能被上游拒"
-                );
-                String::new()
-            }
+        let Some(signature) = self
+            .pending_reasoning_signature
+            .take()
+            .filter(|signature| !signature.trim().is_empty())
+        else {
+            self.set_stream_error("Kiro reasoning stream ended without a signature");
+            self.reasoning_block_open = false;
+            self.thinking_block_index = None;
+            return Vec::new();
         };
         if let Some(delta_event) = self.state_manager.handle_content_block_delta(
             index,
@@ -1150,12 +1221,19 @@ impl StreamContext {
 
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
+        if let Some(error) = self.take_stream_error_event() {
+            return vec![error];
+        }
+        if self.stream_failed {
+            return Vec::new();
+        }
+
         let mut events = Vec::new();
 
-        // reasoning-only 流（无后续 text/tool_use）在结束前关闭 reasoning 块；
-        // close_reasoning_if_open 会清空 thinking_block_index，先快照供下方 thinking-only 语义判断
-        let had_thinking_block = self.thinking_block_index.is_some();
         events.extend(self.close_reasoning_if_open());
+        if let Some(error) = self.take_stream_error_event() {
+            return vec![error];
+        }
 
         // Flush thinking_buffer 中的剩余内容
         if self.thinking_enabled && !self.thinking_buffer.is_empty() {
@@ -1223,7 +1301,7 @@ impl StreamContext {
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
         // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
         if self.thinking_enabled
-            && (had_thinking_block || self.thinking_block_index.is_some())
+            && self.thinking_block_index.is_some()
             && !self.state_manager.has_non_thinking_blocks()
         {
             self.state_manager.set_stop_reason("max_tokens");
@@ -1271,8 +1349,12 @@ impl BufferedStreamContext {
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
-        let inner =
-            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+        let inner = StreamContext::new_with_thinking(
+            model,
+            estimated_input_tokens,
+            thinking_enabled,
+            tool_name_map,
+        );
         Self {
             inner,
             event_buffer: Vec::new(),
@@ -1297,6 +1379,14 @@ impl BufferedStreamContext {
         self.event_buffer.extend(events);
     }
 
+    pub fn set_stream_error(&mut self, message: impl Into<String>) {
+        self.inner.set_stream_error(message);
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.inner.is_failed()
+    }
+
     /// 完成流处理并返回所有事件
     ///
     /// 此方法会：
@@ -1304,6 +1394,11 @@ impl BufferedStreamContext {
     /// 2. 用正确的 input_tokens 更正 message_start 事件
     /// 3. 返回所有缓冲的事件
     pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
+        if self.inner.is_failed() {
+            self.event_buffer.extend(self.inner.generate_final_events());
+            return std::mem::take(&mut self.event_buffer);
+        }
+
         // 如果从未处理过事件，也要生成初始事件
         if !self.initial_events_generated {
             let initial_events = self.inner.generate_initial_events();
@@ -1406,11 +1501,140 @@ mod tests {
     }
 
     #[test]
+    fn test_native_redacted_reasoning_streams_as_redacted_thinking_block() {
+        // Given: a Kiro reasoning event containing only opaque redacted content.
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-5", 1, true, HashMap::new());
+        let event = Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+            text: String::new(),
+            signature: None,
+            redacted_content: Some("opaque-data".to_string()),
+        });
+
+        // When: the event is converted to Anthropic SSE.
+        let events = ctx.process_kiro_event(&event);
+
+        // Then: a complete redacted_thinking block is emitted without a fake thinking block.
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event, "content_block_start");
+        assert_eq!(events[0].data["content_block"]["type"], "redacted_thinking");
+        assert_eq!(events[0].data["content_block"]["data"], "opaque-data");
+        assert_eq!(events[1].event, "content_block_stop");
+    }
+
+    #[test]
+    fn test_signature_only_reasoning_closes_a_valid_thinking_block() {
+        // Given: display=omitted reasoning represented by a signature-only event.
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-5", 1, true, HashMap::new());
+        let event = Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+            text: String::new(),
+            signature: Some("sig-omitted".to_string()),
+            redacted_content: None,
+        });
+
+        // When: the event is processed and the stream is finalized.
+        let mut events = ctx.process_kiro_event(&event);
+        events.extend(ctx.generate_final_events());
+
+        // Then: the signature delta belongs to the thinking block and precedes its stop.
+        let start = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "thinking"
+            })
+            .expect("thinking block should start");
+        let signature = events
+            .iter()
+            .position(|event| event.data["delta"]["type"] == "signature_delta")
+            .expect("signature delta should be emitted");
+        let stop = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_stop"
+                    && event.data["index"] == events[start].data["index"]
+            })
+            .expect("thinking block should stop");
+        assert!(start < signature && signature < stop);
+        assert_eq!(events[signature].data["delta"]["signature"], "sig-omitted");
+        assert!(!events.iter().any(|event| {
+            event.event == "content_block_start" && event.data["content_block"]["type"] == "text"
+        }));
+        let message_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message delta should be emitted");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn test_native_reasoning_is_ignored_when_thinking_is_disabled() {
+        // Given: the client explicitly disabled thinking.
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-5", 1, false, HashMap::new());
+        let event = Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+            text: "private reasoning".to_string(),
+            signature: Some("sig".to_string()),
+            redacted_content: None,
+        });
+
+        // When: an upstream native reasoning event arrives.
+        let events = ctx.process_kiro_event(&event);
+
+        // Then: no thinking block leaks into the disabled response.
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_missing_native_reasoning_signature_emits_stream_error() {
+        // Given: native reasoning text arrives without a verifiable signature.
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-5", 1, true, HashMap::new());
+        let event = Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+            text: "incomplete reasoning".to_string(),
+            signature: None,
+            redacted_content: None,
+        });
+        let _ = ctx.process_kiro_event(&event);
+
+        // When: the upstream stream ends before a signature arrives.
+        let events = ctx.generate_final_events();
+
+        // Then: the proxy reports an error instead of fabricating an empty signature.
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "error");
+        assert_eq!(events[0].data["error"]["type"], "api_error");
+        assert!(!events[0].data.to_string().contains("signature_delta"));
+    }
+
+    #[test]
+    fn test_kiro_error_event_terminates_stream_without_message_stop() {
+        // Given: Kiro reports an upstream protocol error after the message starts.
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-5", 1, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let event = Event::Error {
+            error_code: "UpstreamError".to_string(),
+            error_message: "failed".to_string(),
+        };
+
+        // When: the error is processed and the caller attempts finalization.
+        let mut events = ctx.process_kiro_event(&event);
+        events.extend(ctx.generate_final_events());
+
+        // Then: the error is terminal and no normal completion event is emitted.
+        assert_eq!(
+            events.iter().filter(|event| event.event == "error").count(),
+            1
+        );
+        assert!(!events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
     fn test_tool_name_reverse_mapping_in_stream() {
         use crate::kiro::model::events::ToolUseEvent;
 
         let mut map = HashMap::new();
-        map.insert("short_abc12345".to_string(), "mcp__very_long_original_tool_name".to_string());
+        map.insert(
+            "short_abc12345".to_string(),
+            "mcp__very_long_original_tool_name".to_string(),
+        );
 
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map);
         let _ = ctx.generate_initial_events();
@@ -1426,10 +1650,12 @@ mod tests {
         let events = ctx.process_kiro_event(&tool_event);
 
         // content_block_start 中的 name 应该是原始长名称
-        let start_event = events.iter().find(|e| e.event == "content_block_start").unwrap();
+        let start_event = events
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .unwrap();
         assert_eq!(
-            start_event.data["content_block"]["name"],
-            "mcp__very_long_original_tool_name",
+            start_event.data["content_block"]["name"], "mcp__very_long_original_tool_name",
             "应还原为原始工具名称"
         );
     }
@@ -1851,7 +2077,12 @@ mod tests {
 
         let full_thinking: String = thinking_deltas
             .iter()
-            .filter(|e| !e.data["delta"]["thinking"].as_str().unwrap_or("").is_empty())
+            .filter(|e| {
+                !e.data["delta"]["thinking"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty()
+            })
             .map(|e| e.data["delta"]["thinking"].as_str().unwrap_or(""))
             .collect();
 
@@ -1864,14 +2095,11 @@ mod tests {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
-        let events =
-            ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
+        let events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
 
         let text_deltas: Vec<_> = events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .collect();
 
         let full_text: String = text_deltas
@@ -1903,9 +2131,7 @@ mod tests {
     fn collect_text_content(events: &[SseEvent]) -> String {
         events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .map(|e| e.data["delta"]["text"].as_str().unwrap_or(""))
             .collect()
     }
@@ -1924,7 +2150,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -1942,7 +2172,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -1962,7 +2196,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "text", "text should be 'text', got: {:?}", text);
@@ -1991,7 +2229,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "hello", "thinking should be 'hello', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "hello",
+            "thinking should be 'hello', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "world", "text should be 'world', got: {:?}", text);
@@ -2081,12 +2323,14 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
-        all_events.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-            name: "test_tool".to_string(),
-            tool_use_id: "tool_1".to_string(),
-            input: "{}".to_string(),
-            stop: true,
-        }));
+        all_events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "test_tool".to_string(),
+                tool_use_id: "tool_1".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+        );
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
