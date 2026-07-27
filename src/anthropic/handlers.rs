@@ -2,11 +2,11 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
@@ -24,8 +24,36 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
+};
 use super::websearch;
+
+struct SerializedKiroRequest {
+    primary: String,
+    reasoning_fallback: Option<String>,
+}
+
+impl SerializedKiroRequest {
+    fn new(request: KiroRequest) -> Result<Self, serde_json::Error> {
+        let reasoning_fallback = request
+            .without_reasoning_content()
+            .map(|fallback| serde_json::to_string(&fallback))
+            .transpose()?;
+        let primary = serde_json::to_string(&request)?;
+        Ok(Self {
+            primary,
+            reasoning_fallback,
+        })
+    }
+}
+
+fn record_stream_error(target: &mut Option<String>, message: impl Into<String>) {
+    if target.is_none() {
+        *target = Some(message.into());
+    }
+}
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -125,6 +153,24 @@ pub async fn get_models() -> impl IntoResponse {
             created: 1783900800,
             owned_by: "openai".to_string(),
             display_name: "GPT 5.6 Luna (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "claude-opus-5".to_string(),
+            object: "model".to_string(),
+            created: 1784937600,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "claude-opus-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1784937600,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 128_000,
         },
@@ -339,6 +385,19 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::InvalidThinking(message) => {
+                    ("invalid_request_error", message.clone())
+                }
+                ConversionError::InvalidDocument(message) => {
+                    ("invalid_request_error", format!("文档无效: {}", message))
+                }
+                ConversionError::TooManyDocuments(count) => (
+                    "invalid_request_error",
+                    format!("文档数量超过 Kiro 限制: {} > 5", count),
+                ),
+                ConversionError::DuplicateDocumentName(name) => {
+                    ("invalid_request_error", format!("文档名称重复: {}", name))
+                }
             };
             tracing::warn!("请求转换失败: {}", e);
             return (
@@ -356,7 +415,7 @@ pub async fn post_messages(
         additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
-    let request_body = match serde_json::to_string(&kiro_request) {
+    let request_body = match SerializedKiroRequest::new(kiro_request) {
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
@@ -371,7 +430,7 @@ pub async fn post_messages(
         }
     };
 
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!("Kiro request body: {}", request_body.primary);
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -404,27 +463,42 @@ pub async fn post_messages(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+        )
+        .await
     }
 }
 
 /// 处理流式请求
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    request_body: &str,
+    request_body: &SerializedKiroRequest,
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match provider
+        .call_api_stream(
+            &request_body.primary,
+            request_body.reasoning_fallback.as_deref(),
+        )
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx =
+        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -481,22 +555,35 @@ fn create_sse_stream(
                         Some(Ok(chunk)) => {
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
-                                tracing::warn!("缓冲区溢出: {}", e);
+                                tracing::error!("解码响应流失败: {}", e);
+                                ctx.set_stream_error(format!("Failed to decode Kiro stream: {e}"));
                             }
 
                             let mut events = Vec::new();
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
-                                        if let Ok(event) = Event::from_frame(frame) {
-                                            let sse_events = ctx.process_kiro_event(&event);
-                                            events.extend(sse_events);
+                                        match Event::from_frame(frame) {
+                                            Ok(event) => {
+                                                let sse_events = ctx.process_kiro_event(&event);
+                                                events.extend(sse_events);
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("解析 Kiro 事件失败: {}", e);
+                                                ctx.set_stream_error(format!("Failed to parse Kiro event: {e}"));
+                                            }
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::warn!("解码事件失败: {}", e);
+                                        tracing::error!("解码事件失败: {}", e);
+                                        ctx.set_stream_error(format!("Failed to decode Kiro event: {e}"));
                                     }
                                 }
+                            }
+
+                            let failed = ctx.is_failed();
+                            if failed {
+                                events.extend(ctx.generate_final_events());
                             }
 
                             // 转换为 SSE 字节流
@@ -505,11 +592,11 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, failed, ping_interval)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束
+                            ctx.set_stream_error(format!("Failed to read Kiro response stream: {e}"));
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
@@ -518,7 +605,10 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
                         }
                         None => {
-                            // 流结束，发送最终事件
+                            if let Err(e) = decoder.finish() {
+                                tracing::error!("Kiro 响应流提前结束: {}", e);
+                                ctx.set_stream_error(format!("Kiro response stream was truncated: {e}"));
+                            }
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
@@ -547,14 +637,20 @@ use super::converter::get_context_window_size;
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    request_body: &str,
+    request_body: &SerializedKiroRequest,
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let response = match provider
+        .call_api(
+            &request_body.primary,
+            request_body.reasoning_fallback.as_deref(),
+        )
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -578,155 +674,123 @@ async fn handle_non_stream_request(
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
     if let Err(e) = decoder.feed(&body_bytes) {
-        tracing::warn!("缓冲区溢出: {}", e);
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new(
+                "api_error",
+                format!("Failed to decode Kiro stream: {e}"),
+            )),
+        )
+            .into_response();
     }
 
-    let mut text_content = String::new();
-    let mut reasoning_text = String::new();
-    let mut reasoning_signature: Option<String> = None;
-    let mut tool_uses: Vec<serde_json::Value> = Vec::new();
-    let mut has_tool_use = false;
+    let mut decoded_events = Vec::new();
     let mut stop_reason = "end_turn".to_string();
+    let mut stream_error: Option<String> = None;
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
-
-    // 收集工具调用的增量 JSON
-    let mut tool_json_buffers: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
 
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
-                if let Ok(event) = Event::from_frame(frame) {
-                    match event {
-                        Event::AssistantResponse(resp) => {
-                            text_content.push_str(&resp.content);
-                        }
-                        Event::ReasoningContent(reasoning) => {
-                            reasoning_text.push_str(&reasoning.text);
-                            if let Some(sig) = reasoning.signature {
-                                reasoning_signature = Some(sig);
+                match Event::from_frame(frame) {
+                    Ok(event) => {
+                        match &event {
+                            Event::ContextUsage(context_usage) => {
+                                // 从上下文使用百分比计算实际的 input_tokens
+                                let window_size = get_context_window_size(model);
+                                let actual_input_tokens =
+                                    (context_usage.context_usage_percentage * (window_size as f64)
+                                        / 100.0) as i32;
+                                context_input_tokens = Some(actual_input_tokens);
+                                // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
+                                if context_usage.context_usage_percentage >= 100.0 {
+                                    stop_reason = "model_context_window_exceeded".to_string();
+                                }
+                                tracing::debug!(
+                                    "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                                    context_usage.context_usage_percentage,
+                                    actual_input_tokens
+                                );
                             }
-                        }
-                        Event::ToolUse(tool_use) => {
-                            has_tool_use = true;
-
-                            // 累积工具的 JSON 输入
-                            let buffer = tool_json_buffers
-                                .entry(tool_use.tool_use_id.clone())
-                                .or_insert_with(String::new);
-                            buffer.push_str(&tool_use.input);
-
-                            // 如果是完整的工具调用，添加到列表
-                            if tool_use.stop {
-                                let input: serde_json::Value = if buffer.is_empty() {
-                                    serde_json::json!({})
-                                } else {
-                                    serde_json::from_str(buffer)
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!(
-                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                                e, tool_use.tool_use_id
-                                            );
-                                            serde_json::json!({})
-                                        })
-                                };
-
-                                let original_name = tool_name_map
-                                    .get(&tool_use.name)
-                                    .cloned()
-                                    .unwrap_or_else(|| tool_use.name.clone());
-
-                                tool_uses.push(json!({
-                                    "type": "tool_use",
-                                    "id": tool_use.tool_use_id,
-                                    "name": original_name,
-                                    "input": input
-                                }));
-                            }
-                        }
-                        Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
-                            let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
-                            context_input_tokens = Some(actual_input_tokens);
-                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                            if context_usage.context_usage_percentage >= 100.0 {
-                                stop_reason = "model_context_window_exceeded".to_string();
-                            }
-                            tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
-                                context_usage.context_usage_percentage,
-                                actual_input_tokens
-                            );
-                        }
-                        Event::Exception { exception_type, .. } => {
-                            if exception_type == "ContentLengthExceededException" {
+                            Event::Exception { exception_type, .. }
+                                if exception_type == "ContentLengthExceededException" =>
+                            {
                                 stop_reason = "max_tokens".to_string();
                             }
+                            Event::Error {
+                                error_code,
+                                error_message,
+                            } => {
+                                record_stream_error(
+                                    &mut stream_error,
+                                    format!("Kiro error {error_code}: {error_message}"),
+                                );
+                            }
+                            Event::Exception {
+                                exception_type,
+                                message,
+                            } => {
+                                record_stream_error(
+                                    &mut stream_error,
+                                    format!("Kiro exception {exception_type}: {message}"),
+                                );
+                            }
+                            _ => {}
                         }
-                        _ => {}
+                        decoded_events.push(event);
+                    }
+                    Err(e) => {
+                        record_stream_error(
+                            &mut stream_error,
+                            format!("Failed to parse Kiro event: {e}"),
+                        );
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!("解码事件失败: {}", e);
+                record_stream_error(
+                    &mut stream_error,
+                    format!("Failed to decode Kiro event: {e}"),
+                );
             }
         }
+    }
+
+    if let Err(e) = decoder.finish() {
+        record_stream_error(
+            &mut stream_error,
+            format!("Kiro response stream was truncated: {e}"),
+        );
+    }
+
+    if let Some(message) = stream_error {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new("api_error", message)),
+        )
+            .into_response();
+    }
+
+    let aggregated =
+        super::response::aggregate_content(&decoded_events, thinking_enabled, &tool_name_map);
+
+    if aggregated.has_invalid_reasoning {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new(
+                "api_error",
+                "Kiro reasoning stream ended without a signature",
+            )),
+        )
+            .into_response();
     }
 
     // 确定 stop_reason
-    if has_tool_use && stop_reason == "end_turn" {
+    if aggregated.has_tool_use && stop_reason == "end_turn" {
         stop_reason = "tool_use".to_string();
     }
-
-    // 构建响应内容
-    let mut content: Vec<serde_json::Value> = Vec::new();
-
-    if thinking_enabled {
-        if !reasoning_text.is_empty() {
-            // 原生 reasoningContentEvent（非流式聚合）优先，带上游签发的真实 signature
-            content.push(json!({
-                "type": "thinking",
-                "thinking": reasoning_text,
-                "signature": reasoning_signature.unwrap_or_default()
-            }));
-            if !text_content.is_empty() {
-                content.push(json!({
-                    "type": "text",
-                    "text": text_content
-                }));
-            }
-        } else {
-            // 回退：从完整文本中提取嵌入的 `<thinking>` XML（老式合成式路径）
-            let (thinking, remaining_text) =
-                super::stream::extract_thinking_from_complete_text(&text_content);
-
-            if let Some(thinking_text) = thinking {
-                content.push(json!({
-                    "type": "thinking",
-                    "thinking": thinking_text
-                }));
-            }
-
-            if !remaining_text.is_empty() {
-                content.push(json!({
-                    "type": "text",
-                    "text": remaining_text
-                }));
-            }
-        }
-    } else if !text_content.is_empty() {
-        content.push(json!({
-            "type": "text",
-            "text": text_content
-        }));
-    }
-
-    content.extend(tool_uses);
+    let content = aggregated.content;
 
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
@@ -752,22 +816,19 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
-/// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+/// 检测模型名是否包含 "thinking" 后缀，并在请求未显式配置时填充默认值
 ///
-/// - Opus 4.6：覆写为 adaptive 类型
-/// - 其他模型：覆写为 enabled 类型
-/// - budget_tokens 固定为 20000
+/// - 原生 reasoning 模型：默认 adaptive 类型
+/// - 其他模型：默认 enabled 类型，预算不超过 max_tokens
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
-    if !model_lower.contains("thinking") {
+    if !model_lower.contains("thinking") || payload.thinking.is_some() {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
-    let is_gpt_5_6 = model_lower.contains("gpt-5.6");
+    let native_reasoning = super::converter::model_supports_native_reasoning(&payload.model);
 
-    let thinking_type = if is_opus_4_6 || is_gpt_5_6 {
+    let thinking_type = if native_reasoning {
         "adaptive"
     } else {
         "enabled"
@@ -781,10 +842,12 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 
     payload.thinking = Some(Thinking {
         thinking_type: thinking_type.to_string(),
-        budget_tokens: 20000,
+        budget_tokens: (thinking_type == "enabled")
+            .then(|| 20000.min(payload.max_tokens.saturating_sub(1))),
+        display: None,
     });
-    
-    if is_opus_4_6 || is_gpt_5_6 {
+
+    if native_reasoning && payload.output_config.is_none() {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
@@ -877,6 +940,19 @@ pub async fn post_messages_cc(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::InvalidThinking(message) => {
+                    ("invalid_request_error", message.clone())
+                }
+                ConversionError::InvalidDocument(message) => {
+                    ("invalid_request_error", format!("文档无效: {}", message))
+                }
+                ConversionError::TooManyDocuments(count) => (
+                    "invalid_request_error",
+                    format!("文档数量超过 Kiro 限制: {} > 5", count),
+                ),
+                ConversionError::DuplicateDocumentName(name) => {
+                    ("invalid_request_error", format!("文档名称重复: {}", name))
+                }
             };
             tracing::warn!("请求转换失败: {}", e);
             return (
@@ -894,7 +970,7 @@ pub async fn post_messages_cc(
         additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
-    let request_body = match serde_json::to_string(&kiro_request) {
+    let request_body = match SerializedKiroRequest::new(kiro_request) {
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
@@ -909,7 +985,7 @@ pub async fn post_messages_cc(
         }
     };
 
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!("Kiro request body: {}", request_body.primary);
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -942,7 +1018,15 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+        )
+        .await
     }
 }
 
@@ -952,20 +1036,31 @@ pub async fn post_messages_cc(
 /// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
 async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    request_body: &str,
+    request_body: &SerializedKiroRequest,
     model: &str,
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match provider
+        .call_api_stream(
+            &request_body.primary,
+            request_body.reasoning_fallback.as_deref(),
+        )
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new(
+        model,
+        estimated_input_tokens,
+        thinking_enabled,
+        tool_name_map,
+    );
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);
@@ -1025,27 +1120,40 @@ fn create_buffered_sse_stream(
                             Some(Ok(chunk)) => {
                                 // 解码事件
                                 if let Err(e) = decoder.feed(&chunk) {
-                                    tracing::warn!("缓冲区溢出: {}", e);
+                                    tracing::error!("解码响应流失败: {}", e);
+                                    ctx.set_stream_error(format!("Failed to decode Kiro stream: {e}"));
                                 }
 
                                 for result in decoder.decode_iter() {
                                     match result {
                                         Ok(frame) => {
-                                            if let Ok(event) = Event::from_frame(frame) {
-                                                // 缓冲事件（复用 StreamContext 的处理逻辑）
-                                                ctx.process_and_buffer(&event);
+                                            match Event::from_frame(frame) {
+                                                Ok(event) => ctx.process_and_buffer(&event),
+                                                Err(e) => {
+                                                    tracing::error!("解析 Kiro 事件失败: {}", e);
+                                                    ctx.set_stream_error(format!("Failed to parse Kiro event: {e}"));
+                                                }
                                             }
                                         }
                                         Err(e) => {
-                                            tracing::warn!("解码事件失败: {}", e);
+                                            tracing::error!("解码事件失败: {}", e);
+                                            ctx.set_stream_error(format!("Failed to decode Kiro event: {e}"));
                                         }
                                     }
+                                }
+                                if ctx.is_failed() {
+                                    let all_events = ctx.finish_and_get_all_events();
+                                    let bytes: Vec<Result<Bytes, Infallible>> = all_events
+                                        .into_iter()
+                                        .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                        .collect();
+                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
                                 }
                                 // 继续读取下一个 chunk，不发送任何数据
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
-                                // 发生错误，完成处理并返回所有事件
+                                ctx.set_stream_error(format!("Failed to read Kiro response stream: {e}"));
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
@@ -1054,7 +1162,10 @@ fn create_buffered_sse_stream(
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
                             }
                             None => {
-                                // 流结束，完成处理并返回所有事件（已更正 input_tokens）
+                                if let Err(e) = decoder.finish() {
+                                    tracing::error!("Kiro 响应流提前结束: {}", e);
+                                    ctx.set_stream_error(format!("Kiro response stream was truncated: {e}"));
+                                }
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
@@ -1069,4 +1180,179 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_non_stream_error_preserves_first_failure() {
+        // Given: an upstream protocol error has already identified the root cause.
+        let mut error = None;
+        record_stream_error(&mut error, "Kiro error UpstreamError: failed");
+
+        // When: EOF validation also observes a truncated trailing frame.
+        record_stream_error(&mut error, "Kiro response stream was truncated");
+
+        // Then: the first actionable failure remains the response error.
+        assert_eq!(error.as_deref(), Some("Kiro error UpstreamError: failed"));
+    }
+
+    #[tokio::test]
+    async fn test_truncated_upstream_stream_emits_error_without_message_stop() {
+        // Given: an HTTP upstream ends after ten bytes of an Event Stream frame.
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(|| async { Body::from(vec![0_u8; 10]) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+        let response = reqwest::get(format!("http://{address}/"))
+            .await
+            .expect("test response should arrive");
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5",
+            1,
+            true,
+            std::collections::HashMap::new(),
+        );
+        let initial_events = ctx.generate_initial_events();
+
+        // When: the response is converted through the real SSE stream adapter.
+        let chunks: Vec<_> = create_sse_stream(response, ctx, initial_events)
+            .collect()
+            .await;
+        server.abort();
+        let output = chunks
+            .into_iter()
+            .map(|chunk| chunk.expect("SSE chunks are infallible"))
+            .fold(Vec::new(), |mut output, chunk| {
+                output.extend_from_slice(&chunk);
+                output
+            });
+        let output = String::from_utf8(output).expect("SSE output should be UTF-8");
+
+        // Then: truncation is visible to the client and never reported as normal completion.
+        assert!(output.contains("event: error"));
+        assert!(output.contains("Kiro response stream was truncated"));
+        assert!(!output.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_buffered_truncated_stream_emits_error_without_message_stop() {
+        // Given: buffered mode receives an HTTP body ending mid-frame.
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(|| async { Body::from(vec![0_u8; 10]) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+        let response = reqwest::get(format!("http://{address}/"))
+            .await
+            .expect("test response should arrive");
+        let ctx =
+            BufferedStreamContext::new("claude-opus-5", 1, true, std::collections::HashMap::new());
+
+        // When: the response crosses the buffered SSE adapter.
+        let chunks: Vec<_> = create_buffered_sse_stream(response, ctx).collect().await;
+        server.abort();
+        let output = chunks
+            .into_iter()
+            .map(|chunk| chunk.expect("SSE chunks are infallible"))
+            .fold(Vec::new(), |mut output, chunk| {
+                output.extend_from_slice(&chunk);
+                output
+            });
+        let output = String::from_utf8(output).expect("SSE output should be UTF-8");
+
+        // Then: buffered delivery exposes the truncation without normal completion.
+        assert!(output.contains("event: error"));
+        assert!(output.contains("Kiro response stream was truncated"));
+        assert!(!output.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn test_model_suffix_does_not_override_explicit_thinking_configuration() {
+        // Given: the caller explicitly disabled thinking and selected low effort.
+        let mut payload = MessagesRequest {
+            model: "claude-opus-5-thinking".to_string(),
+            max_tokens: 4096,
+            messages: Vec::new(),
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "disabled".to_string(),
+                budget_tokens: None,
+                display: None,
+            }),
+            output_config: Some(OutputConfig {
+                effort: "low".to_string(),
+            }),
+            metadata: None,
+        };
+
+        // When: the model-name convenience suffix is processed.
+        override_thinking_from_model_name(&mut payload);
+
+        // Then: explicit request fields retain precedence.
+        let thinking = payload.thinking.expect("thinking config should remain");
+        assert_eq!(thinking.thinking_type, "disabled");
+        assert_eq!(
+            payload
+                .output_config
+                .expect("output config should remain")
+                .effort,
+            "low"
+        );
+    }
+
+    #[test]
+    fn test_model_suffix_uses_budget_below_max_tokens() {
+        // Given: a synthetic-thinking model has less than the default 20000-token budget available.
+        let mut payload = MessagesRequest {
+            model: "claude-sonnet-4-5-thinking".to_string(),
+            max_tokens: 10000,
+            messages: Vec::new(),
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        // When: the model-name convenience suffix supplies thinking defaults.
+        override_thinking_from_model_name(&mut payload);
+
+        // Then: the generated budget remains valid for the request's max_tokens.
+        assert_eq!(
+            payload
+                .thinking
+                .expect("thinking should be enabled")
+                .budget_tokens,
+            Some(9999)
+        );
+    }
 }
