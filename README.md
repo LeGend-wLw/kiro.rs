@@ -399,13 +399,10 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 | 端点 | 方法 | 描述 |
 |------|------|------|
-| `/cc/v1/messages` | POST | 创建消息（缓冲模式，确保 `input_tokens` 准确） |
+| `/cc/v1/messages` | POST | 创建消息（Claude Code 兼容路径，实时流式输出） |
 | `/cc/v1/messages/count_tokens` | POST | 估算 Token 数量（与 `/v1` 相同） |
 
-> **`/cc/v1/messages` 与 `/v1/messages` 的区别**：
-> - `/v1/messages`：实时流式返回，`message_start` 中的 `input_tokens` 是估算值
-> - `/cc/v1/messages`：缓冲模式，等待上游流完成后，用从 `contextUsageEvent` 计算的准确 `input_tokens` 更正 `message_start`，然后一次性返回所有事件
-> - 等待期间会每 25 秒发送 `ping` 事件保活
+> `/cc/v1/messages` 与 `/v1/messages` 均实时流式返回；`message_start` 中的 `input_tokens` 使用请求开始时的估算值。
 
 ### Thinking 模式
 

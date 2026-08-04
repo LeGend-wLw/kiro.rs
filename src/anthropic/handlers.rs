@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::stream::{SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
@@ -880,9 +880,6 @@ pub async fn count_tokens(
 
 /// POST /cc/v1/messages
 ///
-/// Claude Code 兼容端点，与 /v1/messages 的区别在于：
-/// - 流式响应会等待 kiro 端返回 contextUsageEvent 后再发送 message_start
-/// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
@@ -1005,8 +1002,7 @@ pub async fn post_messages_cc(
     let tool_name_map = conversion_result.tool_name_map;
 
     if payload.stream {
-        // 流式响应（缓冲模式）
-        handle_stream_request_buffered(
+        handle_stream_request(
             provider,
             &request_body,
             &payload.model,
@@ -1028,158 +1024,6 @@ pub async fn post_messages_cc(
         )
         .await
     }
-}
-
-/// 处理流式请求（缓冲版本）
-///
-/// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
-/// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
-async fn handle_stream_request_buffered(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    request_body: &SerializedKiroRequest,
-    model: &str,
-    estimated_input_tokens: i32,
-    thinking_enabled: bool,
-    tool_name_map: std::collections::HashMap<String, String>,
-) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider
-        .call_api_stream(
-            &request_body.primary,
-            request_body.reasoning_fallback.as_deref(),
-        )
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
-    };
-
-    // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(
-        model,
-        estimated_input_tokens,
-        thinking_enabled,
-        tool_name_map,
-    );
-
-    // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
-
-    // 返回 SSE 响应
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
-}
-
-/// 创建缓冲 SSE 事件流
-///
-/// 工作流程：
-/// 1. 等待上游流完成，期间只发送 ping 保活信号
-/// 2. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
-/// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
-/// 4. 一次性发送所有事件
-fn create_buffered_sse_stream(
-    response: reqwest::Response,
-    ctx: BufferedStreamContext,
-) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let body_stream = response.bytes_stream();
-
-    stream::unfold(
-        (
-            body_stream,
-            ctx,
-            EventStreamDecoder::new(),
-            false,
-            interval(Duration::from_secs(PING_INTERVAL_SECS)),
-        ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
-            if finished {
-                return None;
-            }
-
-            loop {
-                tokio::select! {
-                    // 使用 biased 模式，优先检查 ping 定时器
-                    // 避免在上游 chunk 密集时 ping 被"饿死"
-                    biased;
-
-                    // 优先检查 ping 保活（等待期间唯一发送的数据）
-                    _ = ping_interval.tick() => {
-                        tracing::trace!("发送 ping 保活事件（缓冲模式）");
-                        let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
-                    }
-
-                    // 然后处理数据流
-                    chunk_result = body_stream.next() => {
-                        match chunk_result {
-                            Some(Ok(chunk)) => {
-                                // 解码事件
-                                if let Err(e) = decoder.feed(&chunk) {
-                                    tracing::error!("解码响应流失败: {}", e);
-                                    ctx.set_stream_error(format!("Failed to decode Kiro stream: {e}"));
-                                }
-
-                                for result in decoder.decode_iter() {
-                                    match result {
-                                        Ok(frame) => {
-                                            match Event::from_frame(frame) {
-                                                Ok(event) => ctx.process_and_buffer(&event),
-                                                Err(e) => {
-                                                    tracing::error!("解析 Kiro 事件失败: {}", e);
-                                                    ctx.set_stream_error(format!("Failed to parse Kiro event: {e}"));
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::error!("解码事件失败: {}", e);
-                                            ctx.set_stream_error(format!("Failed to decode Kiro event: {e}"));
-                                        }
-                                    }
-                                }
-                                if ctx.is_failed() {
-                                    let all_events = ctx.finish_and_get_all_events();
-                                    let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                        .into_iter()
-                                        .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                        .collect();
-                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
-                                }
-                                // 继续读取下一个 chunk，不发送任何数据
-                            }
-                            Some(Err(e)) => {
-                                tracing::error!("读取响应流失败: {}", e);
-                                ctx.set_stream_error(format!("Failed to read Kiro response stream: {e}"));
-                                let all_events = ctx.finish_and_get_all_events();
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
-                            }
-                            None => {
-                                if let Err(e) = decoder.finish() {
-                                    tracing::error!("Kiro 响应流提前结束: {}", e);
-                                    ctx.set_stream_error(format!("Kiro response stream was truncated: {e}"));
-                                }
-                                let all_events = ctx.finish_and_get_all_events();
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
-                            }
-                        }
-                    }
-                }
-            }
-        },
-    )
-    .flatten()
 }
 
 #[cfg(test)]
@@ -1248,48 +1092,6 @@ mod tests {
         let output = String::from_utf8(output).expect("SSE output should be UTF-8");
 
         // Then: truncation is visible to the client and never reported as normal completion.
-        assert!(output.contains("event: error"));
-        assert!(output.contains("Kiro response stream was truncated"));
-        assert!(!output.contains("event: message_stop"));
-    }
-
-    #[tokio::test]
-    async fn test_buffered_truncated_stream_emits_error_without_message_stop() {
-        // Given: buffered mode receives an HTTP body ending mid-frame.
-        let app = axum::Router::new().route(
-            "/",
-            axum::routing::get(|| async { Body::from(vec![0_u8; 10]) }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("test listener should bind");
-        let address = listener
-            .local_addr()
-            .expect("listener should have an address");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("test server should run");
-        });
-        let response = reqwest::get(format!("http://{address}/"))
-            .await
-            .expect("test response should arrive");
-        let ctx =
-            BufferedStreamContext::new("claude-opus-5", 1, true, std::collections::HashMap::new());
-
-        // When: the response crosses the buffered SSE adapter.
-        let chunks: Vec<_> = create_buffered_sse_stream(response, ctx).collect().await;
-        server.abort();
-        let output = chunks
-            .into_iter()
-            .map(|chunk| chunk.expect("SSE chunks are infallible"))
-            .fold(Vec::new(), |mut output, chunk| {
-                output.extend_from_slice(&chunk);
-                output
-            });
-        let output = String::from_utf8(output).expect("SSE output should be UTF-8");
-
-        // Then: buffered delivery exposes the truncation without normal completion.
         assert!(output.contains("event: error"));
         assert!(output.contains("Kiro response stream was truncated"));
         assert!(!output.contains("event: message_stop"));
