@@ -10,11 +10,10 @@ use futures::{Stream, StreamExt, stream};
 
 use crate::kiro::model::events::Event;
 use crate::kiro::parser::decoder::EventStreamDecoder;
-use crate::kiro::provider::KiroProvider;
+use crate::kiro::provider::{KiroProvider, STREAM_START_ATTEMPTS};
 
 const TRANSIENT_UPSTREAM_ERROR: &str =
     "Encountered an unexpected error when processing the request, please try again.";
-const STREAM_START_ATTEMPTS: usize = 3;
 const MAX_PREFETCH_BYTES: usize = 1024 * 1024;
 
 type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
@@ -127,7 +126,7 @@ impl KiroStreamResponse {
             let fallback_request_body = fallback_request_body.clone();
             Box::pin(async move {
                 provider
-                    .call_api_with_retry(&request_body, fallback_request_body.as_deref(), true)
+                    .call_api_stream_attempt(&request_body, fallback_request_body.as_deref())
                     .await
             }) as RetryFuture
         });

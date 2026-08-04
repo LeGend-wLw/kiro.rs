@@ -24,6 +24,8 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
+pub(super) const STREAM_START_ATTEMPTS: usize = 3;
+const STREAM_ATTEMPT_RETRY_LIMIT: usize = MAX_TOTAL_RETRIES / STREAM_START_ATTEMPTS;
 
 /// Kiro API Provider
 ///
@@ -119,8 +121,13 @@ impl KiroProvider {
         request_body: &str,
         fallback_request_body: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, fallback_request_body, false)
-            .await
+        self.call_api_with_retry(
+            request_body,
+            fallback_request_body,
+            false,
+            MAX_TOTAL_RETRIES,
+        )
+        .await
     }
 
     /// 发送流式 API 请求
@@ -130,7 +137,7 @@ impl KiroProvider {
         fallback_request_body: Option<&str>,
     ) -> anyhow::Result<crate::kiro::stream_response::KiroStreamResponse> {
         let response = self
-            .call_api_with_retry(request_body, fallback_request_body, true)
+            .call_api_stream_attempt(request_body, fallback_request_body)
             .await?;
         Ok(crate::kiro::stream_response::KiroStreamResponse::new(
             self.clone(),
@@ -138,6 +145,20 @@ impl KiroProvider {
             request_body,
             fallback_request_body,
         ))
+    }
+
+    pub(super) async fn call_api_stream_attempt(
+        &self,
+        request_body: &str,
+        fallback_request_body: Option<&str>,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.call_api_with_retry(
+            request_body,
+            fallback_request_body,
+            true,
+            STREAM_ATTEMPT_RETRY_LIMIT,
+        )
+        .await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -219,7 +240,7 @@ impl KiroProvider {
             }
 
             // 失败响应
-            let body = response.text().await.unwrap_or_default();
+            let body = response.text().await?;
 
             // 402 额度用尽
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -242,16 +263,26 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self
-                        .token_manager
-                        .force_refresh_token_for(ctx.id)
-                        .await
-                        .is_ok()
-                    {
-                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
-                        continue;
+                    match self.token_manager.force_refresh_token_for(ctx.id).await {
+                        Ok(()) => {
+                            tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                            continue;
+                        }
+                        Err(error)
+                            if crate::kiro::token_manager::is_refresh_transport_error(&error) =>
+                        {
+                            return Err(
+                                error.context(format!("凭据 #{} token 强制刷新传输失败", ctx.id))
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "凭据 #{} token 强制刷新失败，计入失败: {:#}",
+                                ctx.id,
+                                error
+                            );
+                        }
                     }
-                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
                 let has_available = self.token_manager.report_failure(ctx.id);
@@ -306,9 +337,12 @@ impl KiroProvider {
         request_body: &str,
         fallback_request_body: Option<&str>,
         is_stream: bool,
+        retry_limit: usize,
     ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL)
+            .min(MAX_TOTAL_RETRIES)
+            .min(retry_limit);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut active_request_body = request_body;
@@ -386,7 +420,7 @@ impl KiroProvider {
             }
 
             // 失败响应：读取 body 用于日志/错误信息
-            let body = response.text().await.unwrap_or_default();
+            let body = response.text().await?;
 
             if !fallback_used
                 && Self::is_thinking_signature_invalid(status, &body)
@@ -446,16 +480,26 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self
-                        .token_manager
-                        .force_refresh_token_for(ctx.id)
-                        .await
-                        .is_ok()
-                    {
-                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
-                        continue;
+                    match self.token_manager.force_refresh_token_for(ctx.id).await {
+                        Ok(()) => {
+                            tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                            continue;
+                        }
+                        Err(error)
+                            if crate::kiro::token_manager::is_refresh_transport_error(&error) =>
+                        {
+                            return Err(
+                                error.context(format!("凭据 #{} token 强制刷新传输失败", ctx.id))
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "凭据 #{} token 强制刷新失败，计入失败: {:#}",
+                                ctx.id,
+                                error
+                            );
+                        }
                     }
-                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
                 let has_available = self.token_manager.report_failure(ctx.id);
@@ -567,8 +611,15 @@ impl KiroProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::KiroProvider;
+    use super::{
+        KiroProvider, MAX_TOTAL_RETRIES, STREAM_ATTEMPT_RETRY_LIMIT, STREAM_START_ATTEMPTS,
+    };
     use std::time::Duration;
+
+    #[test]
+    fn stream_retry_budget_never_exceeds_global_limit() {
+        assert!(STREAM_START_ATTEMPTS * STREAM_ATTEMPT_RETRY_LIMIT <= MAX_TOTAL_RETRIES);
+    }
 
     #[test]
     fn retry_delay_at_high_attempts_is_capped_at_30_seconds() {
