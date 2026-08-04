@@ -613,7 +613,7 @@ killall kiro-rs
 **解决**：kiro-rs 会自动刷新 Token，无需手动干预。如刷新失败：
 1. 检查 `refreshToken` 是否有效
 2. 检查网络是否可访问 `authRegion` 的 IdC 服务
-3. 查看日志 `tail -f /tmp/kiro-rs.log`
+3. 按 6.1 节以前台方式运行 `RUST_LOG=debug ./target/release/kiro-rs -c config.json --credentials credentials.json`，在当前终端查看刷新日志
 
 ---
 
