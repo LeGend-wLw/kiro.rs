@@ -47,6 +47,25 @@ impl std::error::Error for RefreshTransportError {
     }
 }
 
+pub(crate) fn is_refresh_transport_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RefreshTransportError>().is_some()
+}
+
+async fn read_refresh_response(
+    response: reqwest::Response,
+    endpoint: &str,
+) -> anyhow::Result<(reqwest::StatusCode, bytes::Bytes)> {
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|source| RefreshTransportError {
+            endpoint: endpoint.to_string(),
+            source,
+        })?;
+    Ok((status, body))
+}
+
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
     credentials: &KiroCredentials,
@@ -206,9 +225,9 @@ async fn refresh_social_token(
             source,
         })?;
 
-    let status = response.status();
+    let (status, response_body) = read_refresh_response(response, &refresh_domain).await?;
     if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
+        let body_text = String::from_utf8_lossy(&response_body);
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -231,7 +250,7 @@ async fn refresh_social_token(
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    let data: RefreshResponse = response.json().await?;
+    let data: RefreshResponse = serde_json::from_slice(&response_body)?;
 
     let mut new_credentials = credentials.clone();
     new_credentials.access_token = Some(data.access_token);
@@ -273,6 +292,7 @@ async fn refresh_idc_token(
     // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
     let region = credentials.effective_auth_region(config);
     let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
+    let refresh_domain = format!("oidc.{}.amazonaws.com", region);
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
@@ -300,7 +320,7 @@ async fn refresh_idc_token(
         .header("content-type", "application/json")
         .header("x-amz-user-agent", x_amz_user_agent)
         .header("user-agent", &user_agent)
-        .header("host", format!("oidc.{}.amazonaws.com", region))
+        .header("host", &refresh_domain)
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=4")
         .header("Connection", "close")
@@ -308,13 +328,13 @@ async fn refresh_idc_token(
         .send()
         .await
         .map_err(|source| RefreshTransportError {
-            endpoint: format!("oidc.{}.amazonaws.com", region),
+            endpoint: refresh_domain.clone(),
             source,
         })?;
 
-    let status = response.status();
+    let (status, response_body) = read_refresh_response(response, &refresh_domain).await?;
     if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
+        let body_text = String::from_utf8_lossy(&response_body);
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -337,7 +357,7 @@ async fn refresh_idc_token(
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    let data: IdcRefreshResponse = response.json().await?;
+    let data: IdcRefreshResponse = serde_json::from_slice(&response_body)?;
 
     let mut new_credentials = credentials.clone();
     new_credentials.access_token = Some(data.access_token);
