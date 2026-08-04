@@ -95,6 +95,8 @@ cargo build --release
 
 import sqlite3, json, os, secrets
 
+os.umask(0o077)
+
 # macOS 默认路径
 DB_PATH = os.path.expanduser("~/Library/Application Support/kiro-cli/data.sqlite3")
 # 工程上云路径：/home/docker/.local/share/kiro-cli/data.sqlite3
@@ -102,6 +104,13 @@ DB_PATH = os.path.expanduser("~/Library/Application Support/kiro-cli/data.sqlite
 
 OUTPUT_DIR = os.path.expanduser("~/kiro-rs-config")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.chmod(OUTPUT_DIR, 0o700)
+
+def write_private_json(filename, value):
+    path = os.path.join(OUTPUT_DIR, filename)
+    with open(path, "w") as f:
+        json.dump(value, f, indent=2)
+    os.chmod(path, 0o600)
 
 conn = sqlite3.connect(DB_PATH)
 cur = conn.cursor()
@@ -128,8 +137,7 @@ config = {
     "defaultEndpoint": "ide"
 }
 
-with open(os.path.join(OUTPUT_DIR, "config.json"), "w") as f:
-    json.dump(config, f, indent=2)
+write_private_json("config.json", config)
 
 # --- 生成 credentials.json ---
 cred = {
@@ -144,11 +152,10 @@ if cred["authMethod"] == "idc":
     cred["clientId"] = device.get("client_id", "")
     cred["clientSecret"] = device.get("client_secret", "")
 
-with open(os.path.join(OUTPUT_DIR, "credentials.json"), "w") as f:
-    json.dump(cred, f, indent=2)
+write_private_json("credentials.json", cred)
 
 print(f"✅ 配置已输出到: {OUTPUT_DIR}")
-print(f"🔑 API Key: {config['apiKey']}")
+print("🔑 API Key 已写入 config.json，不在终端显示")
 print(f"🌍 Region: {config['region']}")
 ```
 
@@ -285,10 +292,6 @@ cargo run --release
         <key>Crashed</key>
         <true/>
     </dict>
-    <key>StandardOutPath</key>
-    <string>/tmp/kiro-rs.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/kiro-rs.error.log</string>
 </dict>
 </plist>
 ```

@@ -12,10 +12,6 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/kiro-rs-vpn-watch.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/kiro-rs-vpn-watch.error.log</string>
     <key>ThrottleInterval</key>
     <integer>10</integer>
 </dict>
