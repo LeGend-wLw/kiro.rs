@@ -25,6 +25,28 @@ use crate::kiro::model::token_refresh::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 
+#[derive(Debug)]
+struct RefreshTransportError {
+    endpoint: String,
+    source: reqwest::Error,
+}
+
+impl std::fmt::Display for RefreshTransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Token 刷新网络请求失败（{}）: {}",
+            self.endpoint, self.source
+        )
+    }
+}
+
+impl std::error::Error for RefreshTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
     credentials: &KiroCredentials,
@@ -178,7 +200,11 @@ async fn refresh_social_token(
         .header("Connection", "close")
         .json(&body)
         .send()
-        .await?;
+        .await
+        .map_err(|source| RefreshTransportError {
+            endpoint: refresh_domain.clone(),
+            source,
+        })?;
 
     let status = response.status();
     if !status.is_success() {
@@ -280,7 +306,11 @@ async fn refresh_idc_token(
         .header("Connection", "close")
         .json(&body)
         .send()
-        .await?;
+        .await
+        .map_err(|source| RefreshTransportError {
+            endpoint: format!("oidc.{}.amazonaws.com", region),
+            source,
+        })?;
 
     let status = response.status();
     if !status.is_success() {
@@ -844,6 +874,15 @@ impl MultiTokenManager {
                 }
                 Err(e) => {
                     // refreshToken 永久失效 → 立即禁用，不累计重试
+                    if e.downcast_ref::<RefreshTransportError>().is_some() {
+                        tracing::error!(
+                            "凭据 #{} Token 刷新传输失败，不将凭据标记为失效: {:#}",
+                            id,
+                            e
+                        );
+                        return Err(e);
+                    }
+
                     let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                         tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
                         self.report_refresh_token_invalid(id)
