@@ -10,7 +10,7 @@ use futures::{Stream, StreamExt, stream};
 
 use crate::kiro::model::events::Event;
 use crate::kiro::parser::decoder::EventStreamDecoder;
-use crate::kiro::provider::{KiroProvider, STREAM_START_ATTEMPTS};
+use crate::kiro::provider::{KiroProvider, STREAM_START_ATTEMPTS, SharedStreamRetryBudget};
 
 const TRANSIENT_UPSTREAM_ERROR: &str =
     "Encountered an unexpected error when processing the request, please try again.";
@@ -19,10 +19,12 @@ const MAX_PREFETCH_BYTES: usize = 1024 * 1024;
 type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
 type RetryFuture = Pin<Box<dyn Future<Output = anyhow::Result<reqwest::Response>> + Send>>;
 type RetryRequest = Arc<dyn Fn() -> RetryFuture + Send + Sync>;
+type CanRetryRequest = Arc<dyn Fn() -> bool + Send + Sync>;
 
 pub struct KiroStreamResponse {
     initial_response: reqwest::Response,
     retry_request: RetryRequest,
+    can_retry_request: CanRetryRequest,
 }
 
 struct ProbeState {
@@ -42,6 +44,7 @@ enum StreamMode {
 struct RetryStreamState {
     mode: StreamMode,
     retry_request: RetryRequest,
+    can_retry_request: CanRetryRequest,
     attempt: usize,
 }
 
@@ -91,10 +94,15 @@ impl ProbeState {
 }
 
 impl RetryStreamState {
-    fn new(response: reqwest::Response, retry_request: RetryRequest) -> Self {
+    fn new(
+        response: reqwest::Response,
+        retry_request: RetryRequest,
+        can_retry_request: CanRetryRequest,
+    ) -> Self {
         Self {
             mode: StreamMode::Probe(ProbeState::new(response)),
             retry_request,
+            can_retry_request,
             attempt: 1,
         }
     }
@@ -107,7 +115,7 @@ impl RetryStreamState {
     }
 
     fn can_retry(&self) -> bool {
-        self.attempt < STREAM_START_ATTEMPTS
+        self.attempt < STREAM_START_ATTEMPTS && (self.can_retry_request)()
     }
 }
 
@@ -117,22 +125,31 @@ impl KiroStreamResponse {
         initial_response: reqwest::Response,
         request_body: &str,
         fallback_request_body: Option<&str>,
+        retry_budget: SharedStreamRetryBudget,
     ) -> Self {
         let request_body: Arc<str> = Arc::from(request_body);
         let fallback_request_body: Option<Arc<str>> = fallback_request_body.map(Arc::from);
+        let retry_budget_for_request = retry_budget.clone();
         let retry_request = Arc::new(move || {
             let provider = provider.clone();
             let request_body = request_body.clone();
             let fallback_request_body = fallback_request_body.clone();
+            let retry_budget = retry_budget_for_request.clone();
             Box::pin(async move {
                 provider
-                    .call_api_stream_attempt(&request_body, fallback_request_body.as_deref())
+                    .call_api_stream_attempt(
+                        &request_body,
+                        fallback_request_body.as_deref(),
+                        retry_budget,
+                    )
                     .await
             }) as RetryFuture
         });
+        let can_retry_request = Arc::new(move || retry_budget.lock().can_retry());
         Self {
             initial_response,
             retry_request,
+            can_retry_request,
         }
     }
 
@@ -153,13 +170,18 @@ impl KiroStreamResponse {
         Self {
             initial_response,
             retry_request,
+            can_retry_request: Arc::new(|| true),
         }
     }
 
     pub fn bytes_stream(
         self,
     ) -> Pin<Box<dyn Stream<Item = anyhow::Result<Bytes>> + Send + 'static>> {
-        let state = RetryStreamState::new(self.initial_response, self.retry_request);
+        let state = RetryStreamState::new(
+            self.initial_response,
+            self.retry_request,
+            self.can_retry_request,
+        );
         Box::pin(stream::unfold(state, |mut state| async move {
             loop {
                 let mode = std::mem::replace(&mut state.mode, StreamMode::Finished);
