@@ -125,12 +125,19 @@ impl KiroProvider {
 
     /// 发送流式 API 请求
     pub async fn call_api_stream(
-        &self,
+        self: &Arc<Self>,
         request_body: &str,
         fallback_request_body: Option<&str>,
-    ) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, fallback_request_body, true)
-            .await
+    ) -> anyhow::Result<crate::kiro::stream_response::KiroStreamResponse> {
+        let response = self
+            .call_api_with_retry(request_body, fallback_request_body, true)
+            .await?;
+        Ok(crate::kiro::stream_response::KiroStreamResponse::new(
+            self.clone(),
+            response,
+            request_body,
+            fallback_request_body,
+        ))
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -294,7 +301,7 @@ impl KiroProvider {
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
     /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
     /// - 硬上限 9 次，避免无限重试
-    async fn call_api_with_retry(
+    pub(super) async fn call_api_with_retry(
         &self,
         request_body: &str,
         fallback_request_body: Option<&str>,
@@ -546,7 +553,7 @@ impl KiroProvider {
         status.is_client_error() && body.contains("THINKING_SIGNATURE_INVALID")
     }
 
-    fn retry_delay(attempt: usize) -> Duration {
+    pub(super) fn retry_delay(attempt: usize) -> Duration {
         // 指数退避 + 少量抖动，避免上游抖动时放大故障
         const BASE_MS: u64 = 200;
         const MAX_DELAY_MS: u64 = 30_000;

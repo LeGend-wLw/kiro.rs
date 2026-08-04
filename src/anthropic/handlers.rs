@@ -526,7 +526,7 @@ fn create_ping_sse() -> Bytes {
 
 /// 创建 SSE 事件流
 fn create_sse_stream(
-    response: reqwest::Response,
+    response: crate::kiro::stream_response::KiroStreamResponse,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
@@ -1217,9 +1217,14 @@ mod tests {
                 .await
                 .expect("test server should run");
         });
-        let response = reqwest::get(format!("http://{address}/"))
+        let url = format!("http://{address}/");
+        let response = reqwest::get(url.clone())
             .await
             .expect("test response should arrive");
+        let response = crate::kiro::stream_response::KiroStreamResponse::with_retry_request(
+            response,
+            move || reqwest::get(url.clone()),
+        );
         let mut ctx = StreamContext::new_with_thinking(
             "claude-opus-5",
             1,
