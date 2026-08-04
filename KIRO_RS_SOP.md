@@ -1,7 +1,7 @@
 # Kiro-rs 反代服务配置 SOP
 
-> **适用范围**：macOS（含工程上云环境）  
-> **目的**：将 Kiro 订阅额度通过本地反代提供给 Claude Code / opencode 等 Anthropic API 兼容客户端使用  
+> **适用范围**：macOS（含工程上云环境）
+> **目的**：将 Kiro 订阅额度通过本地反代提供给 Claude Code / opencode 等 Anthropic API 兼容客户端使用
 > **前提条件**：拥有有效的 Kiro 订阅（Pro/Pro+/Power）
 
 ---
@@ -117,14 +117,14 @@ device = auth.get("kirocli:odic:device-registration", {})
 
 # --- 生成 config.json ---
 config = {
-    "host": "0.0.0.0",
+    "host": "127.0.0.1",
     "port": 8990,
     "apiKey": f"sk-kiro-rs-{secrets.token_hex(16)}",
     "region": device.get("region", "us-east-1"),
-    "authRegion": "ap-southeast-1",  # 固定，用于 Token 刷新
+    "authRegion": device.get("region", "us-east-1"),
     "apiRegion": "us-east-1",        # 根据网络环境调整，公司内网通常用 us-east-1
     "tlsBackend": "native-tls",      # 如遇 TLS 错误可切换为 rustls
-    "adminApiKey": "admin",          # 管理界面密码
+    "adminApiKey": f"sk-admin-{secrets.token_hex(16)}",
     "defaultEndpoint": "ide"
 }
 
@@ -186,33 +186,33 @@ arn:aws:codewhisperer:us-east-1:xxx:profile/xxx
 
 ```json
 {
-  "host": "0.0.0.0",
+  "host": "127.0.0.1",
   "port": 8990,
   "apiKey": "sk-kiro-rs-xxx",
   "region": "us-east-1",
-  "authRegion": "ap-southeast-1",
+  "authRegion": "us-east-1",
   "apiRegion": "us-east-1",
   "tlsBackend": "native-tls",
-  "adminApiKey": "admin",
+  "adminApiKey": "sk-admin-请替换为独立强密钥",
   "defaultEndpoint": "ide"
 }
 ```
 
 | 字段 | 说明 | 建议值 |
 |------|------|--------|
-| `host` | 监听地址 | `0.0.0.0`（允许局域网访问）或 `127.0.0.1` |
+| `host` | 监听地址 | 默认使用 `127.0.0.1`；仅在配置访问控制后使用 `0.0.0.0` |
 | `port` | 监听端口 | `8990` |
 | `apiKey` | 自定义 API Key | 随机生成，客户端连接时使用 |
 | `region` | 默认区域 | `us-east-1` |
-| `authRegion` | Token 刷新区域 | `ap-southeast-1`（固定） |
+| `authRegion` | Token 刷新区域 | 使用 Kiro 客户端注册设备记录中的 Region |
 | `apiRegion` | API 请求区域 | `us-east-1`（公司内网通常只能用此） |
 | `tlsBackend` | TLS 实现 | `native-tls`（macOS 推荐）/ `rustls` |
-| `adminApiKey` | 管理后台密码 | 任意字符串 |
+| `adminApiKey` | 管理后台密码 | 使用独立随机强密钥，不要复用示例值 |
 | `proxyUrl` | 全局代理 | 如 `http://proxy:7890`（可选） |
 
 > **Region 选择说明**：
 > - 大多数公司内网只能解析 `*.us-east-1.amazonaws.com`
-> - `authRegion` 保持 `ap-southeast-1`（Kiro 的 IdC 服务固定在此）
+> - `authRegion` 应与 Kiro 客户端注册 IdC 设备时使用的 Region 一致
 > - 如遇 `error sending request` 且 DNS 无法解析，说明 apiRegion 需改为 `us-east-1`
 
 ### 5.2 凭据文件详解
@@ -538,7 +538,7 @@ opencode run -m Kiro-Local/claude-sonnet-4.5 "Hello, who are you?"
 
 ### 9.1 error sending request / DNS 解析失败
 
-**现象**：`error sending request for url (https://q.ap-southeast-1.amazonaws.com/...)`  
+**现象**：`error sending request for url (https://q.ap-southeast-1.amazonaws.com/...)`
 **原因**：公司内网 DNS 无法解析 `ap-southeast-1` 的 AWS 域名
 
 **解决**：
@@ -546,7 +546,7 @@ opencode run -m Kiro-Local/claude-sonnet-4.5 "Hello, who are you?"
 // config.json
 {
   "region": "us-east-1",
-  "authRegion": "ap-southeast-1",
+  "authRegion": "us-east-1",
   "apiRegion": "us-east-1"
 }
 ```
@@ -559,7 +559,7 @@ dig q.ap-southeast-1.amazonaws.com +short  # 可能为空
 
 ### 9.2 400 Bad Request
 
-**现象**：`{"message":"Improperly formed request.","reason":null}`  
+**现象**：`{"message":"Improperly formed request.","reason":null}`
 **原因**：`profileArn` 为空或格式错误
 
 **解决**：
@@ -568,7 +568,7 @@ dig q.ap-southeast-1.amazonaws.com +short  # 可能为空
 
 ### 9.3 Not Found（opencode 连接时）
 
-**现象**：opencode 返回 `Error: Not Found`  
+**现象**：opencode 返回 `Error: Not Found`
 **原因**：`baseURL` 配置错误，路径不匹配
 
 **解决**：
@@ -583,7 +583,7 @@ dig q.ap-southeast-1.amazonaws.com +short  # 可能为空
 
 ### 9.4 TLS / 证书错误
 
-**现象**：请求失败，提示 TLS 相关错误  
+**现象**：请求失败，提示 TLS 相关错误
 **解决**：切换 `tlsBackend`：
 
 ```json
@@ -593,7 +593,7 @@ dig q.ap-southeast-1.amazonaws.com +short  # 可能为空
 
 ### 9.5 服务端口冲突
 
-**现象**：`Address already in use (os error 48)`  
+**现象**：`Address already in use (os error 48)`
 **解决**：
 ```bash
 # 查找占用端口的进程
@@ -604,7 +604,7 @@ killall kiro-rs
 
 ### 9.6 Token 过期
 
-**现象**：API 调用突然失败，提示认证错误  
+**现象**：API 调用突然失败，提示认证错误
 **原因**：`accessToken` 过期（通常 1 小时）
 
 **解决**：kiro-rs 会自动刷新 Token，无需手动干预。如刷新失败：
