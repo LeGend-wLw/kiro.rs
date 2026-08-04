@@ -89,6 +89,11 @@ pub fn build_client(
 
         builder = builder.proxy(proxy);
         tracing::debug!("HTTP Client 使用代理: {}", proxy_config.url);
+    } else {
+        // 未配置代理时必须直连，避免 reqwest 的 system-proxy 从企业 VPN/PAC
+        // 或环境变量中注入另一条出站路径。
+        builder = builder.no_proxy();
+        tracing::debug!("HTTP Client 使用直连（已禁用系统代理）");
     }
 
     Ok(builder.build()?)
