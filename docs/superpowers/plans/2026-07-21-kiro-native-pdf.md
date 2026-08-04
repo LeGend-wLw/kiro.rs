@@ -31,11 +31,10 @@
 ### Task 3: Parse and validate Anthropic PDFs
 
 **Files:**
-- Create: `src/anthropic/document.rs`
-- Modify: `src/anthropic/mod.rs`
+- Modify: `src/anthropic/converter.rs`
 - Modify: `src/anthropic/types.rs`
 
-- [ ] Add a helper that accepts a document content block, requires an inline Base64 source, validates `%PDF` magic bytes, derives/sanitizes a bounded name, and returns `KiroDocument`.
+- [ ] Add a helper that accepts a document content block, requires an inline Base64 source, validates `%PDF` magic bytes, uses its non-empty title or `document.pdf`, and returns `KiroDocument`.
 - [ ] Reject URL/provider-reference sources and unsupported MIME types with a conversion error that handlers expose as `invalid_request_error`.
 - [ ] Preserve existing image and tool-result parsing behavior.
 

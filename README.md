@@ -54,6 +54,8 @@
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
 - **凭据回写**: 多凭据格式下自动回写刷新后的 Token
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
+- **原生 Reasoning**: 支持 GPT 5.6、Claude 4.6+ 与 Claude 5 的 reasoning 事件和 effort 参数
+- **PDF 文档**: 支持将 Anthropic Base64 PDF 内容块转发到 Kiro 原生文档字段
 - **工具调用**: 完整支持 function calling / tool use
 - **WebSearch**: 内置 WebSearch 工具转换逻辑
 - **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
@@ -197,6 +199,7 @@ docker-compose up
 | `systemVersion` | string | 随机 | 系统版本标识 |
 | `nodeVersion` | string | `22.21.1` | Node.js 版本标识 |
 | `tlsBackend` | string | `rustls` | TLS 后端：`rustls` 或 `native-tls` |
+| `caCertPath` | string | - | 自定义 PEM/DER 根证书路径，用于企业 TLS 代理 |
 | `countTokensApiUrl` | string | - | 外部 count_tokens API 地址 |
 | `countTokensApiKey` | string | - | 外部 count_tokens API 密钥 |
 | `countTokensAuthType` | string | `x-api-key` | 外部 API 认证类型：`x-api-key` 或 `bearer` |
@@ -217,6 +220,7 @@ docker-compose up
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
    "region": "us-east-1",
    "tlsBackend": "rustls",
+   "caCertPath": "/path/to/company-ca.pem",
    "kiroVersion": "0.9.2",
    "machineId": "64位十六进制机器码",
    "systemVersion": "darwin#24.6.0",
@@ -449,9 +453,14 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 | Anthropic 模型 | Kiro 模型 |
 |----------------|-----------|
-| `*sonnet*` | `claude-sonnet-4.5` |
-| `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
-| `*opus*`（其他） | `claude-opus-4.6` |
+| `gpt-5.6` / `*gpt-5.6-sol*` | `gpt-5.6-sol` |
+| `*gpt-5.6-terra*` | `gpt-5.6-terra` |
+| `*gpt-5.6-luna*` | `gpt-5.6-luna` |
+| `claude-sonnet-5` | `claude-sonnet-5` |
+| `*sonnet-4.6*` | `claude-sonnet-4.6` |
+| `*sonnet-4.5*` | `claude-sonnet-4.5` |
+| `claude-opus-5` | `claude-opus-5` |
+| `*opus-4.5*` 至 `*opus-4.8*` | 对应版本的 Claude Opus |
 | `*haiku*` | `claude-haiku-4.5` |
 
 ## Admin（可选）
