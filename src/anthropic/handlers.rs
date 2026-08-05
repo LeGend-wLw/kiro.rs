@@ -55,6 +55,34 @@ fn record_stream_error(target: &mut Option<String>, message: impl Into<String>) 
     }
 }
 
+fn log_stream_read_error(error: &Error) {
+    let Some(diagnostic) = error.downcast_ref::<crate::kiro::stream_response::StreamReadError>()
+    else {
+        tracing::error!(error = %error, "读取响应流失败");
+        return;
+    };
+
+    tracing::error!(
+        stream_id = %diagnostic.stream_id,
+        attempt = diagnostic.attempt,
+        http_version = ?diagnostic.http_version,
+        content_length = ?diagnostic.content_length,
+        transfer_encoding = ?diagnostic.transfer_encoding,
+        connection = ?diagnostic.connection,
+        aws_request_id = ?diagnostic.aws_request_id,
+        elapsed_ms = ?diagnostic.elapsed.as_millis(),
+        idle_ms = ?diagnostic.idle.as_millis(),
+        chunks_read = diagnostic.chunks_read,
+        bytes_read = diagnostic.bytes_read,
+        is_timeout = diagnostic.is_timeout(),
+        is_connect = diagnostic.is_connect(),
+        is_body = diagnostic.is_body(),
+        is_decode = diagnostic.is_decode(),
+        error_chain = %diagnostic.source_chain(),
+        "Kiro 上游响应体读取失败"
+    );
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
@@ -595,8 +623,25 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, failed, ping_interval)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", e);
-                            ctx.set_stream_error(format!("Failed to read Kiro response stream: {e}"));
+                            log_stream_read_error(&e);
+                            if e
+                                .downcast_ref::<crate::kiro::stream_response::StreamTruncatedError>()
+                                .is_some()
+                            {
+                                ctx.set_stream_error(format!("upstream_incomplete_stream: {e}"));
+                            } else if e.downcast_ref::<
+                                    crate::kiro::stream_response::StreamReadError,
+                                >()
+                                .is_some_and(|error| {
+                                    (error.is_body() || error.is_decode()) && !error.is_timeout()
+                                })
+                            {
+                                ctx.set_stream_error(
+                                    "upstream_incomplete_stream: Upstream Kiro response stream ended before completion",
+                                );
+                            } else {
+                                ctx.set_stream_error(format!("Failed to read Kiro response stream: {e}"));
+                            }
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
@@ -607,7 +652,9 @@ fn create_sse_stream(
                         None => {
                             if let Err(e) = decoder.finish() {
                                 tracing::error!("Kiro 响应流提前结束: {}", e);
-                                ctx.set_stream_error(format!("Kiro response stream was truncated: {e}"));
+                                ctx.set_stream_error(format!(
+                                    "upstream_incomplete_stream: Kiro response stream was truncated: {e}"
+                                ));
                             }
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -1029,6 +1076,11 @@ pub async fn post_messages_cc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_non_stream_error_preserves_first_failure() {
@@ -1045,56 +1097,111 @@ mod tests {
 
     #[tokio::test]
     async fn test_truncated_upstream_stream_emits_error_without_message_stop() {
-        // Given: an HTTP upstream ends after ten bytes of an Event Stream frame.
-        let app = axum::Router::new().route(
-            "/",
-            axum::routing::get(|| async { Body::from(vec![0_u8; 10]) }),
-        );
+        // Given: one complete assistant event is followed by a missing HTTP chunk terminator.
+        let mut encoded_headers = Vec::new();
+        for (name, value) in [
+            (":message-type", "event"),
+            (":event-type", "assistantResponseEvent"),
+        ] {
+            encoded_headers.push(name.len() as u8);
+            encoded_headers.extend_from_slice(name.as_bytes());
+            encoded_headers.push(7);
+            encoded_headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            encoded_headers.extend_from_slice(value.as_bytes());
+        }
+        let payload = br#"{"content":"recovered"}"#;
+        let total_length = 16 + encoded_headers.len() + payload.len();
+        let mut frame = Vec::with_capacity(total_length);
+        frame.extend_from_slice(&(total_length as u32).to_be_bytes());
+        frame.extend_from_slice(&(encoded_headers.len() as u32).to_be_bytes());
+        let prelude_crc = crate::kiro::parser::crc::crc32(&frame);
+        frame.extend_from_slice(&prelude_crc.to_be_bytes());
+        frame.extend_from_slice(&encoded_headers);
+        frame.extend_from_slice(payload);
+        let message_crc = crate::kiro::parser::crc::crc32(&frame);
+        frame.extend_from_slice(&message_crc.to_be_bytes());
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test listener should bind");
         let address = listener
             .local_addr()
             .expect("listener should have an address");
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            axum::serve(listener, app)
+            let (mut socket, _) = listener.accept().await.expect("client should connect");
+            let mut request = [0_u8; 4096];
+            let _ = socket
+                .read(&mut request)
                 .await
-                .expect("test server should run");
+                .expect("request should be readable");
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .expect("response headers should be written");
+            socket
+                .write_all(format!("{:X}\r\n", frame.len()).as_bytes())
+                .await
+                .expect("chunk size should be written");
+            socket
+                .write_all(&frame)
+                .await
+                .expect("event frame should be written");
+            socket
+                .write_all(b"\r\n")
+                .await
+                .expect("chunk delimiter should be written");
+            close_rx.await.expect("test should request truncation");
         });
         let url = format!("http://{address}/");
         let response = reqwest::get(url.clone())
             .await
             .expect("test response should arrive");
+        let retry_calls = Arc::new(AtomicUsize::new(0));
+        let retry_calls_for_request = retry_calls.clone();
         let response = crate::kiro::stream_response::KiroStreamResponse::with_retry_request(
             response,
-            move || reqwest::get(url.clone()),
+            move || {
+                retry_calls_for_request.fetch_add(1, Ordering::SeqCst);
+                reqwest::get(url.clone())
+            },
         );
         let mut ctx = StreamContext::new_with_thinking(
             "claude-opus-5",
             1,
-            true,
+            false,
             std::collections::HashMap::new(),
         );
         let initial_events = ctx.generate_initial_events();
 
-        // When: the response is converted through the real SSE stream adapter.
-        let chunks: Vec<_> = create_sse_stream(response, ctx, initial_events)
-            .collect()
-            .await;
-        server.abort();
-        let output = chunks
-            .into_iter()
-            .map(|chunk| chunk.expect("SSE chunks are infallible"))
-            .fold(Vec::new(), |mut output, chunk| {
-                output.extend_from_slice(&chunk);
+        // When: downstream receives the event before the upstream connection is truncated.
+        let mut stream = Box::pin(create_sse_stream(response, ctx, initial_events));
+        let output = tokio::time::timeout(Duration::from_secs(5), async move {
+            let mut output = String::new();
+            let mut close_tx = Some(close_tx);
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.expect("SSE chunks are infallible");
                 output
-            });
-        let output = String::from_utf8(output).expect("SSE output should be UTF-8");
+                    .push_str(std::str::from_utf8(&chunk).expect("SSE output should remain UTF-8"));
+                if output.contains("recovered")
+                    && let Some(sender) = close_tx.take()
+                {
+                    sender.send(()).expect("server should still be waiting");
+                }
+            }
+            output
+        })
+        .await
+        .expect("SSE stream should terminate after truncation");
+        server.await.expect("test server should exit");
 
-        // Then: truncation is visible to the client and never reported as normal completion.
-        assert!(output.contains("event: error"));
-        assert!(output.contains("Kiro response stream was truncated"));
+        // Then: content is not replayed and truncation remains an Anthropic-compatible error.
+        assert_eq!(output.matches("recovered").count(), 1);
+        assert_eq!(output.matches("event: error").count(), 1);
+        assert!(output.contains(r#""type":"api_error""#));
+        assert!(output.contains("upstream_incomplete_stream"));
         assert!(!output.contains("event: message_stop"));
+        assert_eq!(retry_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
