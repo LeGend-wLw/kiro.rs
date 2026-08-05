@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_client, build_streaming_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -85,6 +85,12 @@ fn is_transient_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 429) || status.is_server_error()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ClientKind {
+    Standard,
+    Streaming,
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -96,7 +102,7 @@ pub struct KiroProvider {
     global_proxy: Option<ProxyConfig>,
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
-    client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
+    client_cache: Mutex<HashMap<(Option<ProxyConfig>, ClientKind), Client>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
@@ -130,7 +136,7 @@ impl KiroProvider {
         let initial_client = build_client(proxy.as_ref(), 720, tls_backend, ca_cert_path)
             .expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
-        cache.insert(proxy.clone(), initial_client);
+        cache.insert((proxy.clone(), ClientKind::Standard), initial_client);
 
         Self {
             token_manager,
@@ -143,19 +149,27 @@ impl KiroProvider {
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
-    fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
+    fn client_for(
+        &self,
+        credentials: &KiroCredentials,
+        kind: ClientKind,
+    ) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let key = (effective.clone(), kind);
         let mut cache = self.client_cache.lock();
-        if let Some(client) = cache.get(&effective) {
+        if let Some(client) = cache.get(&key) {
             return Ok(client.clone());
         }
-        let client = build_client(
-            effective.as_ref(),
-            720,
-            self.tls_backend,
-            self.token_manager.config().ca_cert_path.as_deref(),
-        )?;
-        cache.insert(effective, client.clone());
+        let ca_cert_path = self.token_manager.config().ca_cert_path.as_deref();
+        let client = match kind {
+            ClientKind::Standard => {
+                build_client(effective.as_ref(), 720, self.tls_backend, ca_cert_path)?
+            }
+            ClientKind::Streaming => {
+                build_streaming_client(effective.as_ref(), 720, self.tls_backend, ca_cert_path)?
+            }
+        };
+        cache.insert(key, client.clone());
         Ok(client)
     }
 
@@ -272,7 +286,7 @@ impl KiroProvider {
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
             let base = self
-                .client_for(&ctx.credentials)?
+                .client_for(&ctx.credentials, ClientKind::Standard)?
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json")
@@ -482,8 +496,13 @@ impl KiroProvider {
             let url = endpoint.api_url(&rctx);
             let body = endpoint.transform_api_body(active_request_body, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            let kind = if is_stream {
+                ClientKind::Streaming
+            } else {
+                ClientKind::Standard
+            };
+            let client = self.client_for(&ctx.credentials, kind)?;
+            let base = client
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json")
