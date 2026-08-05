@@ -3,6 +3,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn event_stream_frame(headers: &[(&str, &str)], payload: &str) -> Vec<u8> {
     let mut encoded_headers = Vec::new();
@@ -72,6 +73,72 @@ where
             .expect("test server should run");
     });
     (format!("http://{address}/"), server)
+}
+
+async fn truncated_response_server(
+    body: Vec<u8>,
+) -> (
+    String,
+    usize,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should have an address");
+    let declared_length = body.len() + 64;
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut first_socket, _) = listener.accept().await.expect("client should connect");
+        let mut request = [0_u8; 4096];
+        let _ = first_socket
+            .read(&mut request)
+            .await
+            .expect("first request should be readable");
+        let first_body = exception_frame();
+        let first_headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            first_body.len()
+        );
+        first_socket
+            .write_all(first_headers.as_bytes())
+            .await
+            .expect("first headers should be written");
+        first_socket
+            .write_all(&first_body)
+            .await
+            .expect("first body should be written");
+        drop(first_socket);
+
+        let (mut socket, _) = listener.accept().await.expect("client should connect");
+        let _ = socket
+            .read(&mut request)
+            .await
+            .expect("retry request should be readable");
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n"
+        );
+        socket
+            .write_all(headers.as_bytes())
+            .await
+            .expect("headers should be written");
+        socket
+            .write_all(&body)
+            .await
+            .expect("partial body should be written");
+        close_rx
+            .await
+            .expect("test should request connection close");
+    });
+    (
+        format!("http://{address}/"),
+        declared_length,
+        close_tx,
+        server,
+    )
 }
 
 async fn collect(response: KiroStreamResponse) -> anyhow::Result<Vec<u8>> {
@@ -195,4 +262,45 @@ async fn empty_stream_is_retried_then_reported_as_an_error() {
     // Then: the retry budget is used and EOF remains visible.
     assert_eq!(attempts.load(Ordering::SeqCst), 3);
     assert!(error.to_string().contains("before its first event"));
+}
+
+#[tokio::test]
+async fn truncated_http_body_preserves_transport_diagnostics() {
+    // Given: HTTP declares a body longer than the valid first event it sends.
+    let body = assistant_frame();
+    let body_length = body.len();
+    let (url, declared_length, close_tx, server) = truncated_response_server(body).await;
+    let initial = reqwest::get(url.clone())
+        .await
+        .expect("initial response should arrive");
+    let retry_url = url.clone();
+    let response =
+        KiroStreamResponse::with_retry_request(initial, move || reqwest::get(retry_url.clone()));
+
+    // When: reqwest receives the valid first event, then observes an early EOF.
+    let mut stream = response.bytes_stream();
+    let first_chunk = stream
+        .next()
+        .await
+        .expect("the first chunk should arrive")
+        .expect("the first chunk should be valid");
+    close_tx.send(()).expect("server should still be waiting");
+    let error = stream
+        .next()
+        .await
+        .expect("the transport error should arrive")
+        .expect_err("the truncated body must fail");
+    server.await.expect("test server should exit");
+
+    // Then: the transport failure retains correlation, framing, and read progress.
+    let diagnostic = error
+        .downcast_ref::<StreamReadError>()
+        .expect("transport diagnostics should be preserved");
+    assert_eq!(first_chunk.len(), body_length);
+    assert_eq!(diagnostic.content_length, Some(declared_length as u64));
+    assert_eq!(diagnostic.bytes_read, body_length);
+    assert_eq!(diagnostic.http_version, reqwest::Version::HTTP_11);
+    assert!(!diagnostic.stream_id.is_nil());
+    assert!(!diagnostic.source_chain().is_empty());
+    assert!(!diagnostic.is_timeout());
 }

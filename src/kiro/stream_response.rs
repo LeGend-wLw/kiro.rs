@@ -1,5 +1,7 @@
 //! Kiro 流式响应启动阶段的预取与瞬态错误识别。
 
+mod diagnostics;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,6 +13,9 @@ use futures::{Stream, StreamExt, stream};
 use crate::kiro::model::events::Event;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::{KiroProvider, STREAM_START_ATTEMPTS, SharedStreamRetryBudget};
+
+use diagnostics::StreamDiagnostics;
+pub(crate) use diagnostics::{StreamReadError, StreamTruncatedError};
 
 const TRANSIENT_UPSTREAM_ERROR: &str =
     "Encountered an unexpected error when processing the request, please try again.";
@@ -46,6 +51,7 @@ struct RetryStreamState {
     retry_request: RetryRequest,
     can_retry_request: CanRetryRequest,
     attempt: usize,
+    diagnostics: StreamDiagnostics,
 }
 
 enum ProbeDecision {
@@ -99,11 +105,13 @@ impl RetryStreamState {
         retry_request: RetryRequest,
         can_retry_request: CanRetryRequest,
     ) -> Self {
+        let diagnostics = StreamDiagnostics::new(&response);
         Self {
             mode: StreamMode::Probe(ProbeState::new(response)),
             retry_request,
             can_retry_request,
             attempt: 1,
+            diagnostics,
         }
     }
 
@@ -111,6 +119,7 @@ impl RetryStreamState {
         tokio::time::sleep(KiroProvider::retry_delay(self.attempt - 1)).await;
         let response = (self.retry_request)().await?;
         self.attempt += 1;
+        self.diagnostics.begin_attempt(&response);
         Ok(ProbeState::new(response))
     }
 
@@ -187,23 +196,28 @@ impl KiroStreamResponse {
                 let mode = std::mem::replace(&mut state.mode, StreamMode::Finished);
                 match mode {
                     StreamMode::Probe(mut probe) => match probe.stream.next().await {
-                        Some(Ok(chunk)) => match probe.push(chunk) {
-                            Ok(ProbeDecision::Continue) => state.mode = StreamMode::Probe(probe),
-                            Ok(ProbeDecision::Ready) => state.mode = probe.into_replay(),
-                            Ok(ProbeDecision::Retry) if state.can_retry() => {
-                                tracing::warn!(
-                                    attempt = state.attempt,
-                                    max_attempts = STREAM_START_ATTEMPTS,
-                                    "Kiro 流启动时返回瞬态异常，正在重试"
-                                );
-                                match state.restart().await {
-                                    Ok(next) => state.mode = StreamMode::Probe(next),
-                                    Err(error) => return Some((Err(error), state)),
+                        Some(Ok(chunk)) => {
+                            state.diagnostics.record_chunk(chunk.len());
+                            match probe.push(chunk) {
+                                Ok(ProbeDecision::Continue) => {
+                                    state.mode = StreamMode::Probe(probe)
                                 }
+                                Ok(ProbeDecision::Ready) => state.mode = probe.into_replay(),
+                                Ok(ProbeDecision::Retry) if state.can_retry() => {
+                                    tracing::warn!(
+                                        attempt = state.attempt,
+                                        max_attempts = STREAM_START_ATTEMPTS,
+                                        "Kiro 流启动时返回瞬态异常，正在重试"
+                                    );
+                                    match state.restart().await {
+                                        Ok(next) => state.mode = StreamMode::Probe(next),
+                                        Err(error) => return Some((Err(error), state)),
+                                    }
+                                }
+                                Ok(ProbeDecision::Retry) => state.mode = probe.into_replay(),
+                                Err(error) => return Some((Err(error), state)),
                             }
-                            Ok(ProbeDecision::Retry) => state.mode = probe.into_replay(),
-                            Err(error) => return Some((Err(error), state)),
-                        },
+                        }
                         Some(Err(error)) if state.can_retry() => {
                             tracing::warn!(
                                 attempt = state.attempt,
@@ -216,7 +230,10 @@ impl KiroStreamResponse {
                                 Err(error) => return Some((Err(error), state)),
                             }
                         }
-                        Some(Err(error)) => return Some((Err(error.into()), state)),
+                        Some(Err(error)) => {
+                            let error = state.diagnostics.read_error(state.attempt, error);
+                            return Some((Err(error.into()), state));
+                        }
                         None if state.can_retry() => match state.restart().await {
                             Ok(next) => state.mode = StreamMode::Probe(next),
                             Err(error) => return Some((Err(error), state)),
@@ -226,9 +243,7 @@ impl KiroStreamResponse {
                                 Ok(()) => {
                                     anyhow::anyhow!("Kiro stream ended before its first event")
                                 }
-                                Err(error) => {
-                                    anyhow::anyhow!("Kiro response stream was truncated: {error}")
-                                }
+                                Err(error) => StreamTruncatedError::new(error).into(),
                             };
                             return Some((Err(error), state));
                         }
@@ -242,10 +257,14 @@ impl KiroStreamResponse {
                     },
                     StreamMode::Pass(mut stream) => match stream.next().await {
                         Some(Ok(chunk)) => {
+                            state.diagnostics.record_chunk(chunk.len());
                             state.mode = StreamMode::Pass(stream);
                             return Some((Ok(chunk), state));
                         }
-                        Some(Err(error)) => return Some((Err(error.into()), state)),
+                        Some(Err(error)) => {
+                            let error = state.diagnostics.read_error(state.attempt, error);
+                            return Some((Err(error.into()), state));
+                        }
                         None => return None,
                     },
                     StreamMode::Finished => return None,
