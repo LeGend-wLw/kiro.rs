@@ -9,6 +9,8 @@ use std::time::Duration;
 use crate::model::config::TlsBackend;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// 代理配置
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -43,19 +45,23 @@ impl ProxyConfig {
 ///
 /// # Arguments
 /// * `proxy` - 可选的代理配置
-/// * `timeout_secs` - 超时时间（秒）
+/// * `read_timeout_secs` - 单次读取超时时间（秒）
 ///
 /// # Returns
 /// 配置好的 reqwest::Client
 pub fn build_client(
     proxy: Option<&ProxyConfig>,
-    timeout_secs: u64,
+    read_timeout_secs: u64,
     tls_backend: TlsBackend,
     ca_cert_path: Option<&str>,
 ) -> anyhow::Result<Client> {
     let mut builder = Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(Duration::from_secs(timeout_secs));
+        .read_timeout(Duration::from_secs(read_timeout_secs))
+        .tcp_keepalive(Some(KEEP_ALIVE_INTERVAL))
+        .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
+        .http2_keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
+        .http2_keep_alive_while_idle(true);
 
     match tls_backend {
         TlsBackend::Rustls => {
@@ -109,6 +115,7 @@ fn load_root_certificate(path: &str) -> anyhow::Result<Certificate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_proxy_config_new() {
@@ -137,5 +144,54 @@ mod tests {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls, None);
         assert!(client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn slow_active_response_can_outlive_configured_timeout() {
+        // Given: a response that stays active but takes longer than the configured timeout overall.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should have an address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("client should connect");
+            let mut request = [0_u8; 1024];
+            let request_bytes = socket
+                .read(&mut request)
+                .await
+                .expect("request should be readable");
+            assert!(request_bytes > 0, "request should not be empty");
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .expect("response headers should be writable");
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                if socket.write_all(b"1\r\na\r\n").await.is_err() {
+                    return;
+                }
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+        let client =
+            build_client(None, 1, TlsBackend::Rustls, None).expect("test client should build");
+
+        // When: the complete active body is consumed.
+        let body = client
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .expect("response headers should arrive")
+            .bytes()
+            .await;
+        server.await.expect("test server should finish");
+
+        // Then: elapsed total time does not abort a body that keeps making progress.
+        assert_eq!(
+            body.expect("active response body should not hit a total timeout"),
+            "aaaa"
+        );
     }
 }
