@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +24,47 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
+
+#[derive(Debug)]
+struct RefreshTransportError {
+    endpoint: String,
+    source: reqwest::Error,
+}
+
+impl std::fmt::Display for RefreshTransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Token 刷新网络请求失败（{}）: {}",
+            self.endpoint, self.source
+        )
+    }
+}
+
+impl std::error::Error for RefreshTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+pub(crate) fn is_refresh_transport_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RefreshTransportError>().is_some()
+}
+
+async fn read_refresh_response(
+    response: reqwest::Response,
+    endpoint: &str,
+) -> anyhow::Result<(reqwest::StatusCode, bytes::Bytes)> {
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|source| RefreshTransportError {
+            endpoint: endpoint.to_string(),
+            source,
+        })?;
+    Ok((status, body))
+}
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -178,11 +219,15 @@ async fn refresh_social_token(
         .header("Connection", "close")
         .json(&body)
         .send()
-        .await?;
+        .await
+        .map_err(|source| RefreshTransportError {
+            endpoint: refresh_domain.clone(),
+            source,
+        })?;
 
-    let status = response.status();
+    let (status, response_body) = read_refresh_response(response, &refresh_domain).await?;
     if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
+        let body_text = String::from_utf8_lossy(&response_body);
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -205,7 +250,7 @@ async fn refresh_social_token(
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    let data: RefreshResponse = response.json().await?;
+    let data: RefreshResponse = serde_json::from_slice(&response_body)?;
 
     let mut new_credentials = credentials.clone();
     new_credentials.access_token = Some(data.access_token);
@@ -247,6 +292,7 @@ async fn refresh_idc_token(
     // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
     let region = credentials.effective_auth_region(config);
     let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
+    let refresh_domain = format!("oidc.{}.amazonaws.com", region);
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
@@ -274,17 +320,21 @@ async fn refresh_idc_token(
         .header("content-type", "application/json")
         .header("x-amz-user-agent", x_amz_user_agent)
         .header("user-agent", &user_agent)
-        .header("host", format!("oidc.{}.amazonaws.com", region))
+        .header("host", &refresh_domain)
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=4")
         .header("Connection", "close")
         .json(&body)
         .send()
-        .await?;
+        .await
+        .map_err(|source| RefreshTransportError {
+            endpoint: refresh_domain.clone(),
+            source,
+        })?;
 
-    let status = response.status();
+    let (status, response_body) = read_refresh_response(response, &refresh_domain).await?;
     if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
+        let body_text = String::from_utf8_lossy(&response_body);
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -307,7 +357,7 @@ async fn refresh_idc_token(
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    let data: IdcRefreshResponse = response.json().await?;
+    let data: IdcRefreshResponse = serde_json::from_slice(&response_body)?;
 
     let mut new_credentials = credentials.clone();
     new_credentials.access_token = Some(data.access_token);
@@ -706,7 +756,11 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    fn select_next_credential(
+        &self,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
 
         // 检查是否是 opus 模型
@@ -718,7 +772,7 @@ impl MultiTokenManager {
         let available: Vec<_> = entries
             .iter()
             .filter(|e| {
-                if e.disabled {
+                if e.disabled || excluded_ids.contains(&e.id) {
                     return false;
                 }
                 // 如果是 opus 模型，需要检查订阅等级
@@ -765,6 +819,14 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+        self.acquire_context_excluding(model, &HashSet::new()).await
+    }
+
+    pub(crate) async fn acquire_context_excluding(
+        &self,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -790,7 +852,9 @@ impl MultiTokenManager {
                     let current_id = *self.current_id.lock();
                     entries
                         .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
+                        .find(|e| {
+                            e.id == current_id && !e.disabled && !excluded_ids.contains(&e.id)
+                        })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
 
@@ -798,7 +862,7 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
+                    let mut best = self.select_next_credential(model, excluded_ids);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -817,7 +881,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model);
+                            best = self.select_next_credential(model, excluded_ids);
                         }
                     }
 
@@ -831,8 +895,19 @@ impl MultiTokenManager {
                         // 注意：必须在 bail! 之前计算 available_count，
                         // 因为 available_count() 会尝试获取 entries 锁，
                         // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        if excluded_ids.is_empty() {
+                            let available = entries.iter().filter(|e| !e.disabled).count();
+                            anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        }
+                        let available = entries
+                            .iter()
+                            .filter(|e| !e.disabled && !excluded_ids.contains(&e.id))
+                            .count();
+                        anyhow::bail!(
+                            "没有符合本次请求重试预算的可用凭据（{}/{}）",
+                            available,
+                            total
+                        );
                     }
                 }
             };
@@ -844,6 +919,15 @@ impl MultiTokenManager {
                 }
                 Err(e) => {
                     // refreshToken 永久失效 → 立即禁用，不累计重试
+                    if e.downcast_ref::<RefreshTransportError>().is_some() {
+                        tracing::error!(
+                            "凭据 #{} Token 刷新传输失败，不将凭据标记为失效: {:#}",
+                            id,
+                            e
+                        );
+                        return Err(e);
+                    }
+
                     let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                         tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
                         self.report_refresh_token_invalid(id)
