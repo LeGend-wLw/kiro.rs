@@ -100,7 +100,9 @@ pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
     let gpt_model = model_lower.replace(' ', "-");
 
-    if gpt_model == "gpt-5.6" || gpt_model.contains("gpt-5.6-sol") {
+    if model_lower == "auto" {
+        Some("auto".to_string())
+    } else if gpt_model == "gpt-5.6" || gpt_model.contains("gpt-5.6-sol") {
         Some("gpt-5.6-sol".to_string())
     } else if gpt_model.contains("gpt-5.6-terra") {
         Some("gpt-5.6-terra".to_string())
@@ -1233,6 +1235,11 @@ mod tests {
                 .contains("sonnet")
         );
         assert!(map_model("claude-sonnet-4-6").unwrap().contains("sonnet"));
+    }
+
+    #[test]
+    fn test_map_model_auto() {
+        assert_eq!(map_model("auto"), Some("auto".to_string()));
     }
 
     #[test]
