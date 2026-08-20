@@ -502,6 +502,7 @@ impl SseStateManager {
 }
 
 use super::converter::get_context_window_size;
+use super::truncation::{TruncationState, record_truncated_response};
 
 /// 流处理上下文
 pub struct StreamContext {
@@ -544,6 +545,9 @@ pub struct StreamContext {
     stream_error: Option<String>,
     /// 是否已经进入不可恢复的流错误状态
     stream_failed: bool,
+    completion_signal_seen: bool,
+    text_content: String,
+    tool_calls: HashMap<String, (String, bool)>,
 }
 
 impl StreamContext {
@@ -574,6 +578,9 @@ impl StreamContext {
             pending_reasoning_signature: None,
             stream_error: None,
             stream_failed: false,
+            completion_signal_seen: false,
+            text_content: String::new(),
+            tool_calls: HashMap::new(),
         }
     }
 
@@ -681,6 +688,10 @@ impl StreamContext {
                 events
             }
             Event::ToolUse(tool_use) => {
+                self.tool_calls.insert(
+                    tool_use.tool_use_id.clone(),
+                    (tool_use.name.clone(), tool_use.stop),
+                );
                 let mut events = self.close_reasoning_if_open();
                 if !self.stream_failed {
                     events.extend(self.process_tool_use(tool_use));
@@ -688,6 +699,7 @@ impl StreamContext {
                 events
             }
             Event::ContextUsage(context_usage) => {
+                self.completion_signal_seen = true;
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
                 let actual_input_tokens =
@@ -703,6 +715,10 @@ impl StreamContext {
                     context_usage.context_usage_percentage,
                     actual_input_tokens
                 );
+                Vec::new()
+            }
+            Event::Metering(()) => {
+                self.completion_signal_seen = true;
                 Vec::new()
             }
             Event::Error {
@@ -1028,6 +1044,7 @@ impl StreamContext {
     /// 返回值包含可能的 content_block_start 事件和 content_block_delta 事件。
     fn create_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        self.text_content.push_str(text);
 
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
         // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致“吞字”。
@@ -1317,6 +1334,15 @@ impl StreamContext {
                 .generate_final_events(final_input_tokens, self.output_tokens),
         );
         events
+    }
+
+    pub fn completion_seen(&self) -> bool {
+        self.completion_signal_seen
+    }
+
+    pub fn mark_truncated(&mut self, state: &TruncationState) {
+        record_truncated_response(state, &self.text_content, &self.tool_calls);
+        self.state_manager.set_stop_reason("max_tokens");
     }
 }
 
@@ -2231,5 +2257,21 @@ mod tests {
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
         );
+    }
+
+    #[test]
+    fn truncated_content_uses_max_tokens_stop_reason() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+        let mut events = ctx.create_text_delta_events("partial");
+
+        ctx.mark_truncated(&TruncationState::new());
+        events.extend(ctx.generate_final_events());
+
+        let message_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("truncated content should emit message_delta");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "max_tokens");
     }
 }

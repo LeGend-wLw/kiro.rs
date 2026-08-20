@@ -24,6 +24,7 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{SseEvent, StreamContext};
+use super::truncation::{TruncationState, apply_recovery, record_truncated_response};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
@@ -387,6 +388,8 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    apply_recovery(&mut payload, &state.truncation_state);
+
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
@@ -486,6 +489,7 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            state.truncation_state.clone(),
         )
         .await
     } else {
@@ -498,6 +502,7 @@ pub async fn post_messages(
             input_tokens,
             extract_thinking,
             tool_name_map,
+            state.truncation_state.clone(),
         )
         .await
     }
@@ -511,6 +516,7 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    truncation_state: std::sync::Arc<TruncationState>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider
@@ -532,7 +538,7 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    let stream = create_sse_stream(response, ctx, initial_events, truncation_state);
 
     // 返回 SSE 响应
     Response::builder()
@@ -557,6 +563,7 @@ fn create_sse_stream(
     response: crate::kiro::stream_response::KiroStreamResponse,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    truncation_state: std::sync::Arc<TruncationState>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -569,8 +576,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), truncation_state),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, truncation_state)| async move {
             if finished {
                 return None;
             }
@@ -620,7 +627,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, failed, ping_interval)))
+                                Some((stream::iter(bytes), (body_stream, ctx, decoder, failed, ping_interval, truncation_state)))
                         }
                         Some(Err(e)) => {
                             log_stream_read_error(&e);
@@ -628,7 +635,10 @@ fn create_sse_stream(
                                 .downcast_ref::<crate::kiro::stream_response::StreamTruncatedError>()
                                 .is_some()
                             {
-                                ctx.set_stream_error(format!("upstream_incomplete_stream: {e}"));
+                                ctx.mark_truncated(&truncation_state);
+                                tracing::warn!(
+                                    "上游流被截断，已按 max_tokens 正常收尾并记录恢复状态: {e}"
+                                );
                             } else if e.downcast_ref::<
                                     crate::kiro::stream_response::StreamReadError,
                                 >()
@@ -636,8 +646,9 @@ fn create_sse_stream(
                                     (error.is_body() || error.is_decode()) && !error.is_timeout()
                                 })
                             {
-                                ctx.set_stream_error(
-                                    "upstream_incomplete_stream: Upstream Kiro response stream ended before completion",
+                                ctx.mark_truncated(&truncation_state);
+                                tracing::warn!(
+                                    "上游响应体读取提前结束，已按 max_tokens 正常收尾并记录恢复状态"
                                 );
                             } else {
                                 ctx.set_stream_error(format!("Failed to read Kiro response stream: {e}"));
@@ -647,21 +658,25 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, truncation_state)))
                         }
                         None => {
                             if let Err(e) = decoder.finish() {
                                 tracing::error!("Kiro 响应流提前结束: {}", e);
-                                ctx.set_stream_error(format!(
-                                    "upstream_incomplete_stream: Kiro response stream was truncated: {e}"
-                                ));
+                                ctx.mark_truncated(&truncation_state);
+                                tracing::warn!(
+                                    "上游流提前结束且解码未完成，已按 max_tokens 正常收尾并记录恢复状态: {e}"
+                                );
+                            }
+                            if !ctx.completion_seen() {
+                                ctx.mark_truncated(&truncation_state);
                             }
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, truncation_state)))
                         }
                     }
                 }
@@ -669,7 +684,10 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    Some((
+                        stream::iter(bytes),
+                        (body_stream, ctx, decoder, false, ping_interval, truncation_state),
+                    ))
                 }
             }
         },
@@ -689,6 +707,7 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    truncation_state: std::sync::Arc<TruncationState>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider
@@ -734,6 +753,9 @@ async fn handle_non_stream_request(
     let mut decoded_events = Vec::new();
     let mut stop_reason = "end_turn".to_string();
     let mut stream_error: Option<String> = None;
+    let mut completion_signal_seen = false;
+    let mut truncated_content = String::new();
+    let mut truncated_tool_calls = std::collections::HashMap::new();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
 
@@ -743,7 +765,20 @@ async fn handle_non_stream_request(
                 match Event::from_frame(frame) {
                     Ok(event) => {
                         match &event {
+                            Event::AssistantResponse(assistant) => {
+                                truncated_content.push_str(&assistant.content);
+                            }
+                            Event::ToolUse(tool_use) => {
+                                truncated_tool_calls.insert(
+                                    tool_use.tool_use_id.clone(),
+                                    (tool_use.name.clone(), tool_use.stop),
+                                );
+                            }
+                            Event::Metering(()) => {
+                                completion_signal_seen = true;
+                            }
                             Event::ContextUsage(context_usage) => {
+                                completion_signal_seen = true;
                                 // 从上下文使用百分比计算实际的 input_tokens
                                 let window_size = get_context_window_size(model);
                                 let actual_input_tokens =
@@ -805,10 +840,18 @@ async fn handle_non_stream_request(
     }
 
     if let Err(e) = decoder.finish() {
+        record_truncated_response(&truncation_state, &truncated_content, &truncated_tool_calls);
         record_stream_error(
             &mut stream_error,
             format!("Kiro response stream was truncated: {e}"),
         );
+    }
+
+    if !completion_signal_seen {
+        record_truncated_response(&truncation_state, &truncated_content, &truncated_tool_calls);
+        if stop_reason == "end_turn" {
+            stop_reason = "max_tokens".to_string();
+        }
     }
 
     if let Some(message) = stream_error {
@@ -958,6 +1001,8 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    apply_recovery(&mut payload, &state.truncation_state);
+
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
@@ -1056,6 +1101,7 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            state.truncation_state.clone(),
         )
         .await
     } else {
@@ -1068,6 +1114,7 @@ pub async fn post_messages_cc(
             input_tokens,
             extract_thinking,
             tool_name_map,
+            state.truncation_state.clone(),
         )
         .await
     }
@@ -1173,9 +1220,15 @@ mod tests {
             std::collections::HashMap::new(),
         );
         let initial_events = ctx.generate_initial_events();
+        let truncation_state = TruncationState::new();
 
         // When: downstream receives the event before the upstream connection is truncated.
-        let mut stream = Box::pin(create_sse_stream(response, ctx, initial_events));
+        let mut stream = Box::pin(create_sse_stream(
+            response,
+            ctx,
+            initial_events,
+            truncation_state.clone(),
+        ));
         let output = tokio::time::timeout(Duration::from_secs(5), async move {
             let mut output = String::new();
             let mut close_tx = Some(close_tx);
@@ -1195,13 +1248,32 @@ mod tests {
         .expect("SSE stream should terminate after truncation");
         server.await.expect("test server should exit");
 
-        // Then: content is not replayed and truncation remains an Anthropic-compatible error.
+        // Then: content is not replayed and truncation completes as a normal message_stop
+        // with stop_reason=max_tokens, so clients treat the partial output as usable.
         assert_eq!(output.matches("recovered").count(), 1);
-        assert_eq!(output.matches("event: error").count(), 1);
-        assert!(output.contains(r#""type":"api_error""#));
-        assert!(output.contains("upstream_incomplete_stream"));
-        assert!(!output.contains("event: message_stop"));
+        assert_eq!(output.matches("event: error").count(), 0);
+        assert!(output.contains(r#""stop_reason":"max_tokens""#));
+        assert!(output.contains("event: message_stop"));
         assert_eq!(retry_calls.load(Ordering::SeqCst), 0);
+
+        let mut next_request = MessagesRequest {
+            model: "claude-opus-5".to_string(),
+            max_tokens: 100,
+            messages: vec![super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("recovered"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        apply_recovery(&mut next_request, &truncation_state);
+        assert_eq!(next_request.messages.len(), 2);
+        assert_eq!(next_request.messages[1].role, "user");
     }
 
     #[test]
