@@ -22,6 +22,7 @@ use tokio::time::interval;
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
+use super::cache;
 use super::middleware::AppState;
 use super::stream::{SseEvent, StreamContext};
 use super::truncation::{TruncationState, apply_recovery, record_truncated_response};
@@ -463,6 +464,14 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body.primary);
 
+    // 计算 prompt cache 拆分（需在 payload 字段被移动前完成）
+    let cache_usage = cache::compute_cache_usage(
+        &payload.model,
+        &payload.system,
+        &payload.messages,
+        &payload.tools,
+    );
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -490,6 +499,7 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map,
             state.truncation_state.clone(),
+            cache_usage,
         )
         .await
     } else {
@@ -503,6 +513,7 @@ pub async fn post_messages(
             extract_thinking,
             tool_name_map,
             state.truncation_state.clone(),
+            cache_usage,
         )
         .await
     }
@@ -517,6 +528,7 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     truncation_state: std::sync::Arc<TruncationState>,
+    cache_usage: Option<crate::anthropic::cache::CacheUsage>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider
@@ -532,7 +544,8 @@ async fn handle_stream_request(
 
     // 创建流处理上下文
     let mut ctx =
-        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map)
+            .with_cache_usage(cache_usage);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -708,6 +721,7 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     truncation_state: std::sync::Arc<TruncationState>,
+    cache_usage: Option<crate::anthropic::cache::CacheUsage>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider
@@ -887,6 +901,8 @@ async fn handle_non_stream_request(
 
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    let (input_tokens, cache_read, cache_creation) =
+        cache::split_input(final_input_tokens as i64, cache_usage);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -898,8 +914,10 @@ async fn handle_non_stream_request(
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": cache_creation,
+            "cache_read_input_tokens": cache_read
         }
     });
 
@@ -1076,6 +1094,14 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body.primary);
 
+    // 计算 prompt cache 拆分（需在 payload 字段被移动前完成）
+    let cache_usage = cache::compute_cache_usage(
+        &payload.model,
+        &payload.system,
+        &payload.messages,
+        &payload.tools,
+    );
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -1102,6 +1128,7 @@ pub async fn post_messages_cc(
             thinking_enabled,
             tool_name_map,
             state.truncation_state.clone(),
+            cache_usage,
         )
         .await
     } else {
@@ -1115,6 +1142,7 @@ pub async fn post_messages_cc(
             extract_thinking,
             tool_name_map,
             state.truncation_state.clone(),
+            cache_usage,
         )
         .await
     }
