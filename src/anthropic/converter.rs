@@ -119,7 +119,11 @@ pub fn map_model(model: &str) -> Option<String> {
             None
         }
     } else if model_lower.contains("opus") {
-        if model_lower == "claude-opus-5" || model_lower.contains("opus-5-") {
+        if model_lower == "claude-opus-5-5" || model_lower.contains("opus-5-5-") {
+            // Anthropic-compatible IDs use hyphens; Kiro's IDE API uses the
+            // dotted family ID for versioned Opus models.
+            Some("claude-opus-5.5".to_string())
+        } else if model_lower == "claude-opus-5" || model_lower.contains("opus-5-") {
             Some("claude-opus-5".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
@@ -152,6 +156,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
                 mapped.as_str(),
                 "claude-sonnet-5"
                     | "claude-sonnet-4.6"
+                    | "claude-opus-5.5"
                     | "claude-opus-5"
                     | "claude-opus-4.6"
                     | "claude-opus-4.7"
@@ -175,6 +180,7 @@ pub fn model_supports_native_reasoning(model: &str) -> bool {
             | Some("gpt-5.6-terra")
             | Some("gpt-5.6-luna")
             | Some("claude-opus-5")
+            | Some("claude-opus-5.5")
             | Some("claude-opus-4.6")
             | Some("claude-opus-4.7")
             | Some("claude-opus-4.8")
@@ -1338,6 +1344,24 @@ mod tests {
         assert_eq!(fields["thinking"]["type"], "adaptive");
         assert_eq!(fields["thinking"]["display"], "omitted");
         assert_eq!(fields["output_config"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn test_map_model_opus_5_5_native_reasoning() {
+        assert_eq!(
+            map_model("claude-opus-5-5"),
+            Some("claude-opus-5.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-5-thinking"),
+            Some("claude-opus-5.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-5-20260922"),
+            Some("claude-opus-5.5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-opus-5-5"), 1_000_000);
+        assert!(model_supports_native_reasoning("claude-opus-5-5"));
     }
 
     #[test]
