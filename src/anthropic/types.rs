@@ -60,19 +60,15 @@ pub struct ModelsResponse {
 
 // === Messages 端点类型 ===
 
-/// 最大思考预算 tokens
-const MAX_BUDGET_TOKENS: i32 = 24576;
-
 /// Thinking 配置
 #[derive(Debug, Deserialize, Clone)]
 pub struct Thinking {
     #[serde(rename = "type")]
     pub thinking_type: String,
-    #[serde(
-        default = "default_budget_tokens",
-        deserialize_with = "deserialize_budget_tokens"
-    )]
-    pub budget_tokens: i32,
+    #[serde(default)]
+    pub budget_tokens: Option<i32>,
+    #[serde(default)]
+    pub display: Option<String>,
 }
 
 impl Thinking {
@@ -80,17 +76,6 @@ impl Thinking {
     pub fn is_enabled(&self) -> bool {
         self.thinking_type == "enabled" || self.thinking_type == "adaptive"
     }
-}
-
-fn default_budget_tokens() -> i32 {
-    20000
-}
-fn deserialize_budget_tokens<'de, D>(deserializer: D) -> Result<i32, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = i32::deserialize(deserializer)?;
-    Ok(value.min(MAX_BUDGET_TOKENS))
 }
 
 /// OutputConfig 配置
@@ -151,6 +136,7 @@ where
         {
             Ok(Some(vec![SystemMessage {
                 text: value.to_string(),
+                cache_control: None,
             }]))
         }
 
@@ -199,6 +185,20 @@ pub struct Message {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMessage {
     pub text: String,
+    /// prompt cache 断点（可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// cache_control 断点（Anthropic prompt caching）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CacheControl {
+    /// 断点类型，目前仅有 "ephemeral"
+    #[serde(rename = "type")]
+    pub cc_type: String,
+    /// 缓存保留时长："5m"（默认）或 "1h"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
 }
 
 /// 工具定义
@@ -223,6 +223,9 @@ pub struct Tool {
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,
+    /// prompt cache 断点（可选，Anthropic 语义中放在最后一个工具上）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// 内容块
@@ -231,9 +234,15 @@ pub struct ContentBlock {
     #[serde(rename = "type")]
     pub block_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

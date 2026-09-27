@@ -58,6 +58,11 @@ pub struct Config {
     #[serde(default = "default_tls_backend")]
     pub tls_backend: TlsBackend,
 
+    /// 自定义根证书路径（PEM/DER），用于公司内网 TLS 代理等场景
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_cert_path: Option<String>,
+
     /// 外部 count_tokens API 地址（可选）
     #[serde(default)]
     pub count_tokens_api_url: Option<String>,
@@ -173,6 +178,7 @@ impl Default for Config {
             system_version: default_system_version(),
             node_version: default_node_version(),
             tls_backend: default_tls_backend(),
+            ca_cert_path: None,
             count_tokens_api_url: None,
             count_tokens_api_key: None,
             count_tokens_auth_type: default_count_tokens_auth_type(),
@@ -236,7 +242,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
 }

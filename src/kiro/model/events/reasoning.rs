@@ -17,7 +17,7 @@ use crate::kiro::parser::frame::Frame;
 use super::base::EventPayload;
 
 /// 推理内容事件负载
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ReasoningContentEvent {
     /// 增量推理文本
@@ -29,6 +29,55 @@ pub struct ReasoningContentEvent {
     /// 打码内容（不可读，可忽略）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redacted_content: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReasoningFields {
+    #[serde(default, alias = "thinkingText", alias = "content")]
+    text: String,
+    #[serde(default)]
+    signature: Option<String>,
+    #[serde(default)]
+    redacted_content: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ReasoningWire {
+    Wrapped {
+        #[serde(rename = "reasoningContentEvent")]
+        event: Box<ReasoningWire>,
+    },
+    Union {
+        #[serde(rename = "reasoningText")]
+        reasoning_text: ReasoningFields,
+    },
+    Flat(ReasoningFields),
+}
+
+impl From<ReasoningWire> for ReasoningContentEvent {
+    fn from(wire: ReasoningWire) -> Self {
+        let fields = match wire {
+            ReasoningWire::Wrapped { event } => return Self::from(*event),
+            ReasoningWire::Union { reasoning_text } => reasoning_text,
+            ReasoningWire::Flat(fields) => fields,
+        };
+        Self {
+            text: fields.text,
+            signature: fields.signature,
+            redacted_content: fields.redacted_content,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReasoningContentEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        ReasoningWire::deserialize(deserializer).map(Self::from)
+    }
 }
 
 impl EventPayload for ReasoningContentEvent {
@@ -62,5 +111,31 @@ mod tests {
         let ev: ReasoningContentEvent = serde_json::from_str(json).unwrap();
         assert_eq!(ev.redacted_content.as_deref(), Some("opaque-blob"));
         assert_eq!(ev.text, "");
+    }
+
+    #[test]
+    fn test_deserialize_reasoning_text_union() {
+        // Given: the newer reasoning union shape used by some Kiro responses.
+        let json = r#"{"reasoningText":{"text":"step","signature":"sig-union"}}"#;
+
+        // When: the payload crosses the event boundary.
+        let event: ReasoningContentEvent = serde_json::from_str(json).unwrap();
+
+        // Then: it has the same normalized fields as the flat event shape.
+        assert_eq!(event.text, "step");
+        assert_eq!(event.signature.as_deref(), Some("sig-union"));
+    }
+
+    #[test]
+    fn test_deserialize_wrapped_reasoning_event() {
+        // Given: an event payload wrapped by its event name.
+        let json = r#"{"reasoningContentEvent":{"text":"wrapped","signature":"sig-wrapped"}}"#;
+
+        // When: the payload crosses the event boundary.
+        let event: ReasoningContentEvent = serde_json::from_str(json).unwrap();
+
+        // Then: the wrapper is removed without losing signed reasoning.
+        assert_eq!(event.text, "wrapped");
+        assert_eq!(event.signature.as_deref(), Some("sig-wrapped"));
     }
 }

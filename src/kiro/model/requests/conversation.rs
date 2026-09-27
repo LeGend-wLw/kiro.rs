@@ -102,6 +102,9 @@ pub struct UserInputMessage {
     /// 图片列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<KiroImage>,
+    /// 文档列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<KiroDocument>,
     /// 消息来源（通常为 "AI_EDITOR"）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
@@ -115,6 +118,7 @@ impl UserInputMessage {
             content: content.into(),
             model_id: model_id.into(),
             images: Vec::new(),
+            documents: Vec::new(),
             origin: Some("AI_EDITOR".to_string()),
         }
     }
@@ -128,6 +132,12 @@ impl UserInputMessage {
     /// 添加图片
     pub fn with_images(mut self, images: Vec<KiroImage>) -> Self {
         self.images = images;
+        self
+    }
+
+    /// 添加文档
+    pub fn with_documents(mut self, documents: Vec<KiroDocument>) -> Self {
+        self.documents = documents;
         self
     }
 
@@ -200,6 +210,40 @@ pub struct KiroImageSource {
     pub bytes: String,
 }
 
+/// Kiro 文档
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroDocument {
+    /// 文档名称
+    pub name: String,
+    /// 文档格式（"pdf"）
+    pub format: String,
+    /// 文档数据源
+    pub source: KiroDocumentSource,
+}
+
+impl KiroDocument {
+    /// 从 base64 数据创建文档
+    pub fn from_base64(
+        name: impl Into<String>,
+        format: impl Into<String>,
+        data: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            format: format.into(),
+            source: KiroDocumentSource { bytes: data.into() },
+        }
+    }
+}
+
+/// Kiro 文档数据源
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroDocumentSource {
+    /// base64 编码的文档数据
+    pub bytes: String,
+}
+
 /// 历史消息
 ///
 /// 可以是用户消息或助手消息
@@ -243,6 +287,9 @@ pub struct UserMessage {
     /// 图片列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<KiroImage>,
+    /// 文档列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<KiroDocument>,
     /// 用户输入消息上下文
     #[serde(default, skip_serializing_if = "is_default_context")]
     pub user_input_message_context: UserInputMessageContext,
@@ -260,6 +307,7 @@ impl UserMessage {
             model_id: model_id.into(),
             origin: Some("AI_EDITOR".to_string()),
             images: Vec::new(),
+            documents: Vec::new(),
             user_input_message_context: UserInputMessageContext::default(),
         }
     }
@@ -267,6 +315,12 @@ impl UserMessage {
     /// 设置图片
     pub fn with_images(mut self, images: Vec<KiroImage>) -> Self {
         self.images = images;
+        self
+    }
+
+    /// 添加文档
+    pub fn with_documents(mut self, documents: Vec<KiroDocument>) -> Self {
+        self.documents = documents;
         self
     }
 
@@ -303,6 +357,43 @@ pub struct AssistantMessage {
     /// 工具使用列表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_uses: Option<Vec<ToolUseEntry>>,
+    /// 可供下一轮验证的原生推理内容
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<ReasoningContent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ReasoningContent {
+    ReasoningText {
+        #[serde(rename = "reasoningText")]
+        reasoning_text: ReasoningText,
+    },
+    RedactedContent {
+        #[serde(rename = "redactedContent")]
+        redacted_content: String,
+    },
+}
+
+impl ReasoningContent {
+    pub fn new(text: String, signature: String) -> Self {
+        Self::ReasoningText {
+            reasoning_text: ReasoningText { text, signature },
+        }
+    }
+
+    pub fn redacted(data: String) -> Self {
+        Self::RedactedContent {
+            redacted_content: data,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningText {
+    pub text: String,
+    pub signature: String,
 }
 
 impl AssistantMessage {
@@ -311,12 +402,18 @@ impl AssistantMessage {
         Self {
             content: content.into(),
             tool_uses: None,
+            reasoning_content: None,
         }
     }
 
     /// 设置工具使用
     pub fn with_tool_uses(mut self, tool_uses: Vec<ToolUseEntry>) -> Self {
         self.tool_uses = Some(tool_uses);
+        self
+    }
+
+    pub fn with_reasoning_content(mut self, reasoning_content: ReasoningContent) -> Self {
+        self.reasoning_content = Some(reasoning_content);
         self
     }
 }
@@ -355,6 +452,31 @@ mod tests {
         let json = serde_json::to_string(&history).unwrap();
         assert!(json.contains("userInputMessage"));
         assert!(json.contains("assistantResponseMessage"));
+    }
+
+    #[test]
+    fn test_reasoning_content_deserializes_redacted_union() {
+        // Given: Kiro's redacted reasoning union shape.
+        let value = serde_json::json!({
+            "content": " ",
+            "reasoningContent": {"redactedContent": "opaque-data"}
+        });
+
+        // When: the history assistant message is parsed and serialized again.
+        let parsed = serde_json::from_value::<AssistantMessage>(value)
+            .expect("redacted reasoning should deserialize");
+        let serialized = serde_json::to_value(parsed).expect("reasoning should serialize");
+
+        // Then: the opaque redacted data survives unchanged.
+        assert_eq!(
+            serialized["reasoningContent"]["redactedContent"],
+            "opaque-data"
+        );
+        assert!(
+            serialized["reasoningContent"]
+                .get("reasoningText")
+                .is_none()
+        );
     }
 
     #[test]
